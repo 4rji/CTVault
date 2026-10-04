@@ -1,3 +1,4 @@
 /ctvault
 *.test
 /coverage.out
+.claude/
