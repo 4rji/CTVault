@@ -4,6 +4,7 @@
 package rfc6962
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -92,7 +93,10 @@ func (c *Client) getJSON(ctx context.Context, path string, q url.Values, v any) 
 		return fmt.Errorf("%w: %s: body exceeds %d bytes", ErrMalformed, u, maxBody)
 	}
 	if err := json.Unmarshal(body, v); err != nil {
-		return fmt.Errorf("%w: %s: %v", ErrMalformed, u, err)
+		// Quote the start of the body: a captive portal or proxy page is then
+		// recognisable instead of a bare JSON syntax error.
+		snippet := bytes.TrimSpace(body[:min(len(body), 60)])
+		return fmt.Errorf("%w: %s: %v (response starts with %q)", ErrMalformed, u, err, snippet)
 	}
 	return nil
 }

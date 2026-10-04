@@ -37,7 +37,8 @@ type Info struct {
 	Path         string // absolute, symlinks resolved
 	Mount        MountEntry
 	IsMountPoint bool
-	OnSystemRoot bool // same device as "/"
+	OnSystemRoot bool     // shares a backing device with "/"
+	Backing      []string // devices that really hold the data (loop/dm/md resolved)
 	FSUUID       string
 	Durability   Durability
 }
@@ -64,7 +65,18 @@ func (c Checker) Inspect(path string) (Info, error) {
 	if !ok {
 		return Info{}, errors.New("mount table has no entry for /")
 	}
-	info := Info{Path: real, Mount: m, IsMountPoint: m.MountPoint == real, OnSystemRoot: m.MajorMinor == sys.MajorMinor}
+	info := Info{Path: real, Mount: m, IsMountPoint: m.MountPoint == real}
+	// A loop image or dm/md device stored on the system disk is the system
+	// disk: compare the devices that really hold the data, not just major:minor.
+	sysBacking, err := c.Probe.BackingDevices(sys)
+	if err != nil {
+		return info, fmt.Errorf("cannot determine the devices behind /: %w", err)
+	}
+	if info.Backing, err = c.Probe.BackingDevices(m); err != nil {
+		return info, fmt.Errorf("cannot determine the devices behind %s: %w", m.MountPoint, err)
+	}
+	info.OnSystemRoot = m.MajorMinor == sys.MajorMinor ||
+		slices.ContainsFunc(info.Backing, func(d string) bool { return slices.Contains(sysBacking, d) })
 	if info.Durability, err = Classify(m); err != nil {
 		return info, err
 	}
@@ -86,32 +98,68 @@ func requireUsable(info Info, opts InitOptions, needMountPoint bool) error {
 	case needMountPoint && !info.IsMountPoint:
 		return volErr("%s is not a mount point; mount the external SSD there first", info.Path)
 	case info.OnSystemRoot:
-		return volErr("%s is on the same device as /; CTVault refuses to write to the system disk", info.Path)
+		return volErr("%s is on the same device as / (its data is stored on %s); CTVault refuses to write to the system disk",
+			info.Path, strings.Join(info.Backing, ", "))
 	case info.Durability == DurabilityUntested && !opts.AllowUntestedFS:
 		return volErr("%s is %s, which is untested; pass --allow-untested-fs to accept weaker durability guarantees", info.Path, info.Mount.FSType)
 	}
 	return nil
 }
 
-// requireEmpty allows only lost+found and leftovers of an interrupted init.
+// requireEmpty allows only lost+found and the leftovers of an interrupted
+// init: empty layout directories, vault/DIR_ID and the temp files of the
+// atomic writes. Anything else (user files, a foreign ctvault.toml, an old
+// vault's segments) means the volume is not dedicated to this vault.
 func requireEmpty(dir string) error {
 	ents, err := os.ReadDir(dir)
 	if err != nil {
 		return err
 	}
-	allowed := map[string]bool{"lost+found": true, "ctvault.toml": true}
+	layout := map[string]bool{}
 	for _, d := range LayoutDirs {
-		allowed[strings.SplitN(d, "/", 2)[0]] = true
+		layout[d] = true
+		layout[strings.SplitN(d, "/", 2)[0]] = true
 	}
 	for _, e := range ents {
-		if e.Name() == VaultIDFile {
+		name := e.Name()
+		switch {
+		case name == VaultIDFile:
 			return volErr("%s is already an initialized CTVault root", dir)
-		}
-		if !allowed[e.Name()] {
-			return volErr("%s is not empty (found %q)", dir, e.Name())
+		case name == "lost+found" || strings.HasPrefix(name, "."+VaultIDFile+".tmp-"):
+			continue
+		case layout[name] && e.IsDir():
+			if err := requireLeftover(dir, name, layout); err != nil {
+				return err
+			}
+		default:
+			return volErr("%s is not empty (found %q)", dir, name)
 		}
 	}
 	return nil
+}
+
+// requireLeftover walks one top-level layout directory and fails on anything
+// an interrupted init could not have created.
+func requireLeftover(root, top string, layout map[string]bool) error {
+	return filepath.WalkDir(filepath.Join(root, top), func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, p)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		dirID := "vault/" + DirIDFile
+		switch {
+		case d.IsDir() && layout[rel]:
+			return nil
+		case d.Type().IsRegular() && (rel == dirID || strings.HasPrefix(rel, "vault/."+DirIDFile+".tmp-")):
+			return nil
+		default:
+			return volErr("%s is not empty (found %q)", root, rel)
+		}
+	})
 }
 
 func (c Checker) now() time.Time {
@@ -224,10 +272,30 @@ func (c Checker) AddDir(root, dir string, opts InitOptions) (VaultID, error) {
 	if err != nil {
 		return id, err
 	}
-	if err := os.Mkdir(dir, 0o755); err != nil && !errors.Is(err, fs.ErrExist) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
 		return id, err
 	}
-	vi, err := c.Inspect(dir)
+	// Check the disk before writing anything (spec §9.1): the nearest existing
+	// ancestor is on the filesystem the new directory will be created on.
+	anc := abs
+	for {
+		if _, err := os.Lstat(anc); err == nil || filepath.Dir(anc) == anc {
+			break
+		}
+		anc = filepath.Dir(anc)
+	}
+	ai, err := c.Inspect(anc)
+	if err != nil {
+		return id, fmt.Errorf("%w: %v", ErrVolume, err)
+	}
+	if err := requireUsable(ai, opts, false); err != nil {
+		return id, err
+	}
+	if err := fsutil.MkdirAllSync(abs, 0o755); err != nil {
+		return id, err
+	}
+	vi, err := c.Inspect(abs)
 	if err != nil {
 		return id, fmt.Errorf("%w: %v", ErrVolume, err)
 	}

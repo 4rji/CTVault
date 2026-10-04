@@ -10,14 +10,24 @@ import (
 	"github.com/4rji/ctvault/internal/volume"
 )
 
-// Probe is an in-memory mount table plus a device → UUID map.
+// Probe is an in-memory mount table plus device → UUID and device → backing
+// device maps.
 type Probe struct {
-	Mounts []volume.MountEntry
-	UUIDs  map[string]string // major:minor → filesystem UUID
+	Mounts  []volume.MountEntry
+	UUIDs   map[string]string   // major:minor → filesystem UUID
+	Backing map[string][]string // major:minor → devices holding its data; default: itself
 }
 
 // MountInfo returns the configured mount table.
 func (p *Probe) MountInfo() ([]volume.MountEntry, error) { return p.Mounts, nil }
+
+// BackingDevices looks the mount's device up in Backing.
+func (p *Probe) BackingDevices(m volume.MountEntry) ([]string, error) {
+	if b, ok := p.Backing[m.MajorMinor]; ok {
+		return b, nil
+	}
+	return []string{m.MajorMinor}, nil
+}
 
 // FSUUID looks the mount's device up in UUIDs.
 func (p *Probe) FSUUID(m volume.MountEntry) (string, error) {
@@ -32,7 +42,8 @@ func New() *Probe {
 	return &Probe{
 		Mounts: []volume.MountEntry{{MountID: 1, MajorMinor: "8:1", Root: "/", MountPoint: "/", FSType: "ext4",
 			Source: "/dev/sda1", MountOptions: []string{"rw"}, SuperOptions: []string{"rw"}}},
-		UUIDs: map[string]string{"8:1": "system-root"},
+		UUIDs:   map[string]string{"8:1": "system-root"},
+		Backing: map[string][]string{},
 	}
 }
 

@@ -14,6 +14,7 @@ import (
 // its hash added here in the same commit (see internal/testdata/README.md).
 var fixtureSHA256 = map[string]string{
 	"log_list_google.json":         "852484a68c18c2eed06211af22148bbb6ca3cb6cfed142dccc31839943e40d19",
+	"log_list_v93.3_full.json":     "d23ab4cd867239b3ff227d52eb9d60210fbd5eb0c66ab2b6d2bded8e6852d406",
 	"argon2027h1_sth1.json":        "32b707ce8a1287e2d4c4b5fe51f531521d27c23fc578b8c9c4c67c8421cdbf65",
 	"argon2027h1_sth2.json":        "6d8d1a6c4ead1dd4053bf0b35c8a8ee05240f97af58982147ef79500827c3db0",
 	"argon2027h1_consistency.json": "182aae03ee72d97002c78250f8830e65bfae66e059d5effc1c26e386b6c0740a",

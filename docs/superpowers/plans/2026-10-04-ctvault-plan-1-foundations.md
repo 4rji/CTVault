@@ -5588,3 +5588,20 @@ Expected: `signature  verified with pinned key`, and a `tree_size` larger than 3
 git add go.mod go.sum internal/cli README.md
 git commit -m "feat(cli): logs list/add/info with live STH verification; README"
 ```
+
+---
+
+## Post-review fixes (applied after execution)
+
+A fresh whole-branch review found 0 Critical and 5 Important issues. Each was fixed test-first: a failing test came first, then the full suite was run. The code now differs from the task text above in these places:
+
+1. **`volume.AddDir`** checks the nearest existing ancestor of the target and refuses before creating anything. It then creates the directory with `MkdirAllSync`. Test: `TestAddDirRefusesSystemDiskAndNonEmpty`.
+2. **`volume.requireEmpty`** accepts only `lost+found`, empty layout directories, `vault/DIR_ID` and the temp files of atomic writes. User files under layout folder names, a foreign `ctvault.toml` and old segments are refused. Tests: `TestInitRefusesUserDataUnderLayoutNames`, `TestInitAcceptsInterruptedInitLeftovers`.
+3. **`Probe.BackingDevices`** (new) follows loop backing files and dm/md slaves through `/sys/dev/block`. `Inspect` refuses any mount whose data shares a device with `/`. Tests:
+   - `TestInitRefusals`: loop image, and dm-crypt on a loop image
+   - `TestInitAcceptsEncryptedExternalDisk`
+   - `TestHostProbeBackingDevices`
+4. **The `rfc6962` client** quotes the first 60 bytes of an unparseable response (Review Focus 5). Test: `TestHTMLPageIsQuoted`.
+5. **`loglist.LogName(description, url)`** uses the single-quoted name in the description. Failing that, it uses a name-like URL segment or host label. Failing that, it uses the sanitized host and path. `Find` matches RFC 6962 logs before tiled ones, and a new immutable fixture `log_list_v93.3_full.json` proves every name in the real list is unique. Tests: `TestLogName`, `TestEveryLogInFullListHasAUniqueName`, `TestFindNonGoogleLogs`.
+
+**Pending: Task 13 Step 8, the real-SSD smoke test, has not been run** (there was no access to the external drive on 2026-10-04). The README's "Pending verification" section has the commands and expected output.

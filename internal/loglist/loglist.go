@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -67,6 +68,7 @@ type Log struct {
 
 type TiledLog struct {
 	Description   string `json:"description"`
+	SubmissionURL string `json:"submission_url"`
 	MonitoringURL string `json:"monitoring_url"`
 }
 
@@ -109,26 +111,51 @@ func Fetch(ctx context.Context, hc *http.Client, src string) (*List, error) {
 	return Parse(body)
 }
 
-// LogName is CTVault's name for an RFC 6962 log: the last URL path segment,
-// lowercased ("https://ct.googleapis.com/logs/us1/argon2027h1/" → "argon2027h1").
-func LogName(logURL string) string {
-	segs := strings.Split(strings.Trim(logURL, "/"), "/")
-	return strings.ToLower(segs[len(segs)-1])
+var (
+	// quotedName is the conventional log name operators put in single quotes
+	// in the description ("DigiCert 'Wyvern2027h1'").
+	quotedName = regexp.MustCompile(`'([A-Za-z0-9][A-Za-z0-9._-]{0,63})'`)
+	// nameLike is a URL path segment or host label that looks like a log
+	// name: starts with a letter and contains a digit ("tuscolo2028h1").
+	nameLike = regexp.MustCompile(`^[a-z][a-z0-9_-]*[0-9][a-z0-9_-]*$`)
+	nonName  = regexp.MustCompile(`[^a-z0-9]+`)
+)
+
+// LogName is CTVault's permanent name for a log; Plan 2 writes it into
+// partition paths and batch IDs, so it must be unique across the log list.
+// It is, in order of preference:
+//  1. the single-quoted name in the description, lowercased
+//     ("DigiCert 'Wyvern2027h1'" → "wyvern2027h1");
+//  2. the last URL path segment, or else the first host label, that looks
+//     like a log name ("https://tuscolo2028h1.sunlight.geomys.org/" → "tuscolo2028h1");
+//  3. the URL's host and path with separators turned into '-'
+//     ("https://ct.example.com/bogus/" → "ct-example-com-bogus").
+func LogName(description, logURL string) string {
+	if m := quotedName.FindStringSubmatch(description); m != nil {
+		return strings.ToLower(m[1])
+	}
+	u, err := url.Parse(logURL)
+	if err != nil {
+		return strings.Trim(nonName.ReplaceAllString(strings.ToLower(logURL), "-"), "-")
+	}
+	segs := strings.Split(strings.Trim(u.Path, "/"), "/")
+	for i := len(segs) - 1; i >= 0; i-- {
+		if s := strings.ToLower(segs[i]); nameLike.MatchString(s) {
+			return s
+		}
+	}
+	if label := strings.ToLower(strings.Split(u.Hostname(), ".")[0]); nameLike.MatchString(label) {
+		return label
+	}
+	name := strings.Trim(nonName.ReplaceAllString(strings.ToLower(u.Hostname()+"/"+u.Path), "-"), "-")
+	return name[:min(len(name), 64)]
 }
 
-// TiledName is the first DNS label of a tiled log's monitoring host
-// ("https://storage.googleapis.com/parcelyard2027h1.prod.…/" → "parcelyard2027h1").
-func TiledName(monitoringURL string) string {
-	u, err := url.Parse(monitoringURL)
-	if err != nil {
-		return ""
-	}
-	host := u.Host
-	if p := strings.Trim(u.Path, "/"); p != "" {
-		host = strings.Split(p, "/")[0]
-	}
-	return strings.ToLower(strings.Split(host, ".")[0])
-}
+// Name is the RFC 6962 log's CTVault name.
+func (lg Log) Name() string { return LogName(lg.Description, lg.URL) }
+
+// Name is the tiled log's CTVault name.
+func (tl TiledLog) Name() string { return LogName(tl.Description, tl.SubmissionURL) }
 
 // Resolved is one named RFC 6962 log.
 type Resolved struct {
@@ -137,24 +164,27 @@ type Resolved struct {
 	Log      Log
 }
 
-// Find resolves a CTVault log name.
+// Find resolves a CTVault log name. RFC 6962 logs are matched first; a name
+// that only matches a tiled log reports ErrTiledUnsupported.
 func (l *List) Find(name string) (Resolved, error) {
 	name = strings.ToLower(strings.TrimSpace(name))
 	var found []Resolved
 	for _, op := range l.Operators {
-		for _, tl := range op.TiledLogs {
-			if TiledName(tl.MonitoringURL) == name {
-				return Resolved{}, fmt.Errorf("%w: %s (%s)", ErrTiledUnsupported, name, tl.Description)
-			}
-		}
 		for _, lg := range op.Logs {
-			if LogName(lg.URL) == name {
+			if lg.Name() == name {
 				found = append(found, Resolved{Name: name, Operator: op.Name, Log: lg})
 			}
 		}
 	}
 	switch len(found) {
 	case 0:
+		for _, op := range l.Operators {
+			for _, tl := range op.TiledLogs {
+				if tl.Name() == name {
+					return Resolved{}, fmt.Errorf("%w: %s (%s)", ErrTiledUnsupported, name, tl.Description)
+				}
+			}
+		}
 		return Resolved{}, fmt.Errorf("%w: %q", ErrNotFound, name)
 	case 1:
 		return found[0], nil
@@ -172,7 +202,7 @@ func (l *List) RFC6962Logs() []Resolved {
 	var out []Resolved
 	for _, op := range l.Operators {
 		for _, lg := range op.Logs {
-			out = append(out, Resolved{Name: LogName(lg.URL), Operator: op.Name, Log: lg})
+			out = append(out, Resolved{Name: lg.Name(), Operator: op.Name, Log: lg})
 		}
 	}
 	slices.SortFunc(out, func(a, b Resolved) int { return strings.Compare(a.Name, b.Name) })

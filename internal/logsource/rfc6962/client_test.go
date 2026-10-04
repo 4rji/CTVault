@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -98,6 +99,30 @@ func TestMalformedResponses(t *testing.T) {
 		srv.Close()
 		if !errors.Is(err, ErrMalformed) {
 			t.Errorf("%s: want ErrMalformed, got %v", name, err)
+		}
+	}
+}
+
+// TestHTMLPageIsQuoted pins Review Focus 5 for the log client: a captive
+// portal, served directly or after a redirect, yields an error that quotes the
+// start of the page so the user sees what answered instead of the log.
+func TestHTMLPageIsQuoted(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/portal", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("<html><body>Hotel Wi-Fi login</body></html>"))
+	})
+	mux.HandleFunc("/direct/ct/v1/get-sth", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("<html><body>Hotel Wi-Fi login</body></html>"))
+	})
+	mux.HandleFunc("/redirected/ct/v1/get-sth", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/portal", http.StatusFound)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	for _, base := range []string{"/direct/", "/redirected/"} {
+		_, err := New(srv.URL+base, nil).GetSTH(ctx)
+		if !errors.Is(err, ErrMalformed) || !strings.Contains(err.Error(), "<html><body>Hotel Wi-Fi") {
+			t.Errorf("%s: error must quote the page, got %v", base, err)
 		}
 	}
 }
