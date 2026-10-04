@@ -9,6 +9,10 @@ import (
 	"github.com/4rji/ctvault/internal/volume"
 )
 
+// writeConfig writes a new vault's ctvault.toml; the dev build replaces it
+// to use 10,000-entry batches (amendment A1 §2.5).
+var writeConfig = config.WriteDefault
+
 func newInitCmd(a *app) *cobra.Command {
 	var allowUntested bool
 	cmd := &cobra.Command{
@@ -20,7 +24,7 @@ func newInitCmd(a *app) *cobra.Command {
 			if err != nil {
 				return volumeErr(err)
 			}
-			if err := config.WriteDefault(args[0]); err != nil {
+			if err := writeConfig(args[0]); err != nil {
 				return err
 			}
 			r := id.Volumes[0]

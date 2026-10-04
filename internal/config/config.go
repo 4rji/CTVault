@@ -206,10 +206,14 @@ func (c Config) Validate() error {
 }
 
 // WriteDefault writes DefaultTOML unless the file already exists.
-func WriteDefault(root string) error {
+func WriteDefault(root string) error { return WriteDefaultBatch(root, Default().Ingest.BatchSize) }
+
+// WriteDefaultBatch is WriteDefault with another ingest.batch_size.
+func WriteDefaultBatch(root string, batchSize int) error {
 	p := filepath.Join(root, FileName)
 	if _, err := os.Stat(p); err == nil {
 		return nil
 	}
-	return fsutil.WriteFileAtomic(p, []byte(DefaultTOML), 0o644)
+	body := strings.Replace(DefaultTOML, "batch_size = 500000", fmt.Sprintf("batch_size = %d", batchSize), 1)
+	return fsutil.WriteFileAtomic(p, []byte(body), 0o644)
 }

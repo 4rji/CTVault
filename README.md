@@ -3,11 +3,15 @@
 A local, cryptographically verified Certificate Transparency research archive.
 Design: `docs/superpowers/specs/2026-10-04-ctvault-design.md`.
 
-**Status:** Plan 2A (collector). You can create a vault on a dedicated ext4
-volume, pin CT logs from Chrome's log list and verify a log's live signed tree
-head. The collector (RFC 6962 entries, leaf decoding, the rate-limited
-fetcher) is built and tested, and the dev build captures verified real-data
-samples. Ingestion into the vault arrives in Plan 2B.
+**Status:** Plan 2B (vault). `ctvault update` ingests pinned logs into the
+vault:
+- Every batch is verified against a signed tree head.
+- Every unique certificate is stored compressed and deduplicated.
+- `entries` and `chains` are written as Parquet, with `views.sql` for the
+  DuckDB CLI.
+- A crash at any point recovers to the last committed batch.
+
+The derived `certs` and `names` tables arrive in Plan 3.
 
 ## Requirements
 
@@ -16,6 +20,8 @@ samples. Ingestion into the vault arrives in Plan 2B.
   FAT, FUSE, network filesystems and tmpfs are always rejected.
 - Go 1.26.8 or newer. With the default `GOTOOLCHAIN=auto`, an older `go`
   downloads the right toolchain automatically.
+- A C compiler (`gcc`) for cgo: CTVault embeds DuckDB. The DuckDB library
+  makes the binary about 100 MB, and a first build takes a minute or two.
 
 ## Build and test
 
@@ -43,7 +49,25 @@ export CTVAULT_ROOT=/mnt/ctvault
 ./ctvault logs add argon2027h1          # pin the log and its public key
 ./ctvault logs info argon2027h1         # fetch and verify the live signed tree head
 ./ctvault vault add-dir /mnt/disk2/ctvault-vault   # optional extra vault disk
+
+./ctvault update                         # ingest up to the current signed head
+./ctvault update --until 1000000         # stop at index 1,000,000 (exclusive)
+./ctvault update --follow                # keep ingesting, one cycle every 10 minutes
 ```
+
+`update` (alias `ingest`):
+- **Batches:** commits batches of `ingest.batch_size` entries, each verified
+  by a consistency proof or the signed root.
+- **Ctrl-C:** the first finishes the current batch; the second abandons it,
+  and it is fetched again next time.
+- **Log misbehaviour:** a shrinking log, a fork or a bad signature is an
+  incident. It is refetched once, then evidence is written to
+  `state/incidents/` and `update` exits 5.
+- **Full disk:** at the disk cap it exits 3 before a batch starts; with
+  `--follow` it waits for the next cycle instead.
+
+The dataset can be queried without CTVault running:
+`duckdb -c ".read /mnt/ctvault/views.sql" -c "SELECT count(*) FROM entries"`.
 
 Log names are the conventional names from the log list, lowercased:
 `argon2027h1`, `wyvern2027h1`, `oak2026h2`, `mammoth2026h2` and so on.
@@ -93,18 +117,41 @@ keeps the same 85% disk cap, applied to the normal disk.
 - A sample is published only after it verifies: the file checksums, the
   signed head with the key pinned from Chrome's log list, and the Merkle
   proofs that tie every entry's `leaf_input` (the logged certificate or
-  precertificate TBS and its timestamp) to that head.
+  precertificate TBS and its timestamp) to that head. It is then read-only
+  and never overwritten; to capture the same range again, add
+  `--suffix <name>`.
 - The chains in `extra_data` are not part of a CT log's Merkle tree (RFC
   6962), so no proof covers them; in a sample they are protected by the
   checksums only. Precertificate cross-checks still flag a chain that does
-  not match the logged TBS. It is then read-only and never
-  overwritten; to capture the same range again, add `--suffix <name>`.
+  not match the logged TBS.
 - An interrupted or failed capture (Ctrl-C, network loss, full disk) leaves
   nothing behind.
 - Every later load verifies the sample again, so a damaged sample is refused
   (exit 5) instead of feeding wrong data.
-- Canonical samples will feed dev vaults (`update --replay`, Plan 2B);
-  representative samples are for measurements only.
+- Representative samples are for measurements only.
+
+### Dev vaults and replay
+
+A dev vault lives under `~/.cache/ctvault-dev/vaults/` and starts with
+10,000-entry batches. A canonical sample feeds it over loopback through the
+same client, fetcher and writer as the live log:
+
+```bash
+./ctvault-dev init ~/.cache/ctvault-dev/vaults/argon
+./ctvault-dev --root ~/.cache/ctvault-dev/vaults/argon logs add argon2027h1
+./ctvault-dev --root ~/.cache/ctvault-dev/vaults/argon update \
+  --replay ~/.cache/ctvault-dev/samples/argon2027h1/000000000000-000000099999
+```
+
+- `--replay` refuses representative samples and samples of another log.
+- With `--replay`, `ingest.batch_size` and `--until` must be multiples of
+  5,000, the sample's proof boundaries.
+- Measured on 2026-10-04: the 100,000-entry canonical sample replays in
+  about 4 minutes, including one-time training of the compression dictionary
+  (about 3.5 minutes).
+- The resulting vault holds about 1.1 KB of vault data, 54 B of Parquet and
+  67 B of index per entry. The shard's first entries are 81% final
+  certificates, so they compress worse than the log's average.
 
 ## Pending verification
 

@@ -72,3 +72,21 @@ func (e *Entry) checkPrecert() {
 		e.fail(PrecertTBSMismatch)
 	}
 }
+
+// PrecertIssuanceDigest recomputes a vaulted precertificate's issuance digest
+// from its own DER: SHA-256 of its TBS without the poison extension. For a
+// CA-issued precert this equals the log's TBS digest. A precert issued by a
+// precertificate signing certificate gets a different digest and simply
+// misses the delta cache. It reports false for anything that is not a
+// parseable precertificate. The delta cache warm-up uses it (amendment A1 §5).
+func PrecertIssuanceDigest(der []byte) ([32]byte, bool) {
+	c, err := parseCert(der)
+	if err != nil || !c.hasExtension(oidPoison) {
+		return [32]byte{}, false
+	}
+	tbs, err := c.rebuildTBS(rewrite{drop: oidPoison})
+	if err != nil {
+		return [32]byte{}, false
+	}
+	return sha256.Sum256(tbs), true
+}

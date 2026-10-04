@@ -8502,3 +8502,33 @@ duckdb -c ".read $HOME/.cache/ctvault-dev/vaults/argon/views.sql" -c "SELECT cou
 Expected:
 - **`update`:** 10 batches, each "verified by consistency_proof", with dictionary 1 trained before the fourth. It takes about 4 minutes.
 - **The DuckDB query** (if the `duckdb` CLI is installed) shows `100000` entries.
+
+---
+
+## Post-review fixes (applied after execution)
+
+A fresh whole-change review found 2 Critical and 5 Important issues. One Minor was raised to Important, because corruption must never be ignored. Each was fixed test-first: a test that reproduced it failed first, then the whole suite ran. The code now differs from the task text above in these places:
+
+1. **C1, recovery could truncate committed data.** If committed batch directories went missing (a mistaken `rm`, a partial restore), recovery truncated the vault data they referenced, and Pebble kept pointing at it.
+   - `commit.Recover` now refuses with exit 5, changing nothing, in two cases: Pebble's `applied/<log>` is ahead of the highest committed batch (new `index.AppliedLogs`), or vault data beyond the committed tail is not explained by an uncommitted intent starting at that tail.
+   - Tests: `TestRecoverRefusesToTruncateUnexplainedData`, `TestRecoverRefusesAnIndexAheadOfTheDataset`.
+2. **C2, a committed batch could be abandoned.**
+   - `commit.Publish` wraps any error after the rename in `commit.ErrPostCommit`, and the engine abandons only before the rename. It used to decide from a `stat` call, so an EACCES or EIO abandoned a committed batch.
+   - Test: `TestErrorAfterTheCommitPointKeepsTheBatch`.
+3. **I1, abandoned IDs were reused after a restart.**
+   - `commit.Abandon` keeps the intent, marked `abandoned`, so the next start resumes at `ID_FLOOR`. A later successful commit clears it (`commit.ClearAbandoned`).
+   - Test: `TestAbandonedIDsAreNeverReusedAfterARestart`.
+4. **I2, segments went to the wrong vault directory.** `preflight` returns the vault directory it reserved space on, and `vault.Writer.Prefer` rolls the batch's new segments into it. A reopened writer now records the vault directory, not its `segments/` subfolder.
+   - Tests: `TestSegmentsGoWhereThePreflightReserved`, `TestPreferStartsNewSegmentsInTheReservedDirectory`, `TestPreferAfterReopenKeepsTheTailSegment`.
+5. **I3, whole segments were read into memory.**
+   - `vault.Scan` and `InspectTail` stream records instead of loading whole segments, and `InspectTail` reads nothing past a clean tail.
+   - `Warm` merges contiguous ranges, and the delta cache is reset and reused (`DeltaCache.Reset`).
+   - Tests: `TestScanAndInspectStream`, `TestDeltaCacheReset`.
+6. **I4, volume checks were not repeated per batch.** `ingest.Options.CheckVolumes` runs at every batch preflight (spec §9.2), and `update` exits 4 when the volume is gone.
+   - Tests: `TestVolumeCheckRunsBeforeEveryBatch`, `TestUpdateStopsWhenTheVolumeDisappears`.
+7. **I5, the incident evidence was too thin.** Batch incidents now record both attempts' causes, the STH and its raw bytes, the compact range before the batch, the computed root and end, and the proof nodes (spec §12).
+   - Test: `TestForkedLogIsAnIncident`.
+8. **M4, raised: corruption during training was ignored.** Corruption met while reading the dictionary training samples now stops the batch with exit 5, instead of being recorded as a training error.
+   - Test: `TestCorruptionFoundByTrainingStops`.
+
+Ten Minor findings are deferred. They are listed in the execution ledger and in the final report.

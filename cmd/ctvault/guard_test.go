@@ -56,6 +56,11 @@ func TestProductionBinaryExcludesDevCode(t *testing.T) {
 				t.Errorf("production binary depends on test/dev-only package %s", p.ImportPath)
 			}
 		}
+		// The _dev.go naming rule is CTVault's own; third-party packages
+		// (prometheus/procfs's net_dev.go, via Pebble) may use the suffix.
+		if !strings.HasPrefix(p.ImportPath, "github.com/4rji/ctvault/") {
+			continue
+		}
 		for _, f := range p.GoFiles {
 			if f == "devprobe.go" || strings.HasSuffix(f, "_dev.go") {
 				t.Errorf("production build of %s compiles dev-only file %s", p.ImportPath, f)
