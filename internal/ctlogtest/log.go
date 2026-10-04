@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/transparency-dev/merkle/rfc6962"
 	"github.com/transparency-dev/merkle/testonly"
@@ -23,13 +24,19 @@ import (
 // Options configures page size and fault injection. Every "Every" counter
 // fires on its Nth matching request (1 = every request, 0 = never).
 type Options struct {
-	PageSize           int // max entries per get-entries response; default 32
-	RateLimitEvery     int // any endpoint answers 429 with Retry-After: 1
-	ShortReadEvery     int // get-entries returns half of what it would have
-	CorruptJSONEvery   int // get-entries returns truncated JSON
-	InvalidBase64Every int // get-entries returns an invalid base64 leaf_input
+	PageSize           int  // max entries per get-entries response; default 32
+	RateLimitEvery     int  // any endpoint answers 429 with Retry-After: 1
+	NoRetryAfter       bool // 429 answers omit Retry-After
+	ServerErrorEvery   int  // any endpoint answers 503 (no Retry-After)
+	ShortReadEvery     int  // get-entries returns half of what it would have
+	CorruptJSONEvery   int  // get-entries returns truncated JSON
+	InvalidBase64Every int  // get-entries returns an invalid base64 leaf_input
 	BadSTHSignature    bool
 	AlterEntries       []uint64 // these indices are served with a modified leaf_input
+	// EntriesDelay, if set, delays each get-entries response by the returned
+	// duration before any lock is taken, so concurrent requests can complete
+	// out of order. It receives the requested start index.
+	EntriesDelay func(start uint64) time.Duration
 }
 
 // Log is a running fake log.
@@ -39,6 +46,7 @@ type Log struct {
 	LogID        [32]byte
 	Entries      []Entry
 
+	t    testing.TB
 	key  *ecdsa.PrivateKey
 	opts Options
 	srv  *httptest.Server
@@ -49,6 +57,7 @@ type Log struct {
 	published uint64
 	counts    map[string]int
 	altered   map[uint64]bool
+	byHash    map[[32]byte]uint64 // leaf hash → first index, for get-proof-by-hash
 }
 
 // New starts a fake log holding n generated entries, all published.
@@ -79,11 +88,16 @@ func NewWithEntries(t testing.TB, entries []Entry, opts Options) *Log {
 	if err != nil {
 		t.Fatal(err)
 	}
-	l := &Log{PublicKeyDER: spki, LogID: sha256.Sum256(spki), Entries: entries, key: key, opts: opts,
+	l := &Log{PublicKeyDER: spki, LogID: sha256.Sum256(spki), Entries: entries, t: t, key: key, opts: opts,
 		honest: testonly.New(rfc6962.DefaultHasher), published: uint64(len(entries)),
-		counts: map[string]int{}, altered: map[uint64]bool{}}
-	for _, e := range entries {
+		counts: map[string]int{}, altered: map[uint64]bool{}, byHash: map[[32]byte]uint64{}}
+	for i, e := range entries {
 		l.honest.AppendData(e.LeafInput)
+		var h [32]byte
+		copy(h[:], rfc6962.DefaultHasher.HashLeaf(e.LeafInput))
+		if _, dup := l.byHash[h]; !dup {
+			l.byHash[h] = uint64(i)
+		}
 	}
 	l.tree = l.honest
 	for _, i := range opts.AlterEntries {
@@ -93,6 +107,7 @@ func NewWithEntries(t testing.TB, entries []Entry, opts Options) *Log {
 	mux.HandleFunc("GET /ct/v1/get-sth", l.getSTH)
 	mux.HandleFunc("GET /ct/v1/get-sth-consistency", l.getConsistency)
 	mux.HandleFunc("GET /ct/v1/get-entries", l.getEntries)
+	mux.HandleFunc("GET /ct/v1/get-proof-by-hash", l.getProofByHash)
 	l.srv = httptest.NewServer(mux)
 	t.Cleanup(l.srv.Close)
 	l.URL = l.srv.URL + "/"
@@ -111,8 +126,12 @@ func (l *Log) Publish(size uint64) {
 }
 
 // Fork makes STHs and proofs come from a tree whose leaf at index differs:
-// a split view that consistency checks must detect.
+// a split view that consistency checks must detect. An index outside the log
+// fails the test instead of silently forking nothing.
 func (l *Log) Fork(index uint64) {
+	if index >= uint64(len(l.Entries)) {
+		l.t.Fatalf("ctlogtest: Fork(%d) is outside a log of %d entries", index, len(l.Entries))
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	fork := testonly.New(rfc6962.DefaultHasher)
@@ -149,8 +168,14 @@ func (l *Log) begin(w http.ResponseWriter, endpoint string) (int, bool) {
 	l.counts[endpoint]++
 	l.counts["all"]++
 	if every(l.opts.RateLimitEvery, l.counts["all"]) {
-		w.Header().Set("Retry-After", "1")
+		if !l.opts.NoRetryAfter {
+			w.Header().Set("Retry-After", "1")
+		}
 		http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+		return 0, false
+	}
+	if every(l.opts.ServerErrorEvery, l.counts["all"]) {
+		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
 		return 0, false
 	}
 	return l.counts[endpoint], true
@@ -233,6 +258,15 @@ func (l *Log) getConsistency(w http.ResponseWriter, r *http.Request) {
 }
 
 func (l *Log) getEntries(w http.ResponseWriter, r *http.Request) {
+	if l.opts.EntriesDelay != nil {
+		if start, _, err := parseRange(r, "start", "end"); err == nil {
+			select {
+			case <-time.After(l.opts.EntriesDelay(start)):
+			case <-r.Context().Done():
+				return
+			}
+		}
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	n, ok := l.begin(w, "get-entries")
@@ -271,4 +305,35 @@ func (l *Log) getEntries(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]any{"entries": out})
+}
+
+func (l *Log) getProofByHash(w http.ResponseWriter, r *http.Request) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if _, ok := l.begin(w, "get-proof-by-hash"); !ok {
+		return
+	}
+	raw, err := base64.StdEncoding.DecodeString(r.URL.Query().Get("hash"))
+	size, err2 := strconv.ParseUint(r.URL.Query().Get("tree_size"), 10, 64)
+	if err != nil || err2 != nil || len(raw) != 32 || size == 0 || size > l.tree.Size() {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	var h [32]byte
+	copy(h[:], raw)
+	idx, ok := l.byHash[h]
+	if !ok || idx >= size {
+		http.Error(w, "leaf not found", http.StatusNotFound)
+		return
+	}
+	proof, err := l.tree.InclusionProof(idx, size)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	path := make([]string, len(proof))
+	for i, p := range proof {
+		path[i] = base64.StdEncoding.EncodeToString(p)
+	}
+	writeJSON(w, map[string]any{"leaf_index": idx, "audit_path": path})
 }

@@ -8,14 +8,18 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"strings"
 
 	"golang.org/x/sys/unix"
 )
 
-// Usage is a filesystem's size and the space available to unprivileged writers.
+// Usage is a filesystem's size and the space available to unprivileged
+// writers. Dev identifies the filesystem (st_dev of the path), so targets that
+// share one are checked together.
 type Usage struct {
 	Total uint64
 	Avail uint64
+	Dev   uint64
 }
 
 // Used counts everything not available to us, including ext4's reserved blocks.
@@ -37,17 +41,22 @@ func (u Usage) UsedFraction() float64 {
 // StatFunc reports usage for the filesystem holding path.
 type StatFunc func(path string) (Usage, error)
 
-// Statfs is the real StatFunc: (f_blocks − f_bavail) × fragment size.
+// Statfs is the real StatFunc: (f_blocks − f_bavail) × fragment size, with
+// the filesystem identified by the path's st_dev.
 func Statfs(path string) (Usage, error) {
 	var st unix.Statfs_t
 	if err := unix.Statfs(path, &st); err != nil {
+		return Usage{}, err
+	}
+	var fi unix.Stat_t
+	if err := unix.Stat(path, &fi); err != nil {
 		return Usage{}, err
 	}
 	bs := uint64(st.Frsize)
 	if bs == 0 {
 		bs = uint64(st.Bsize)
 	}
-	return Usage{Total: st.Blocks * bs, Avail: st.Bavail * bs}, nil
+	return Usage{Total: st.Blocks * bs, Avail: st.Bavail * bs, Dev: uint64(fi.Dev)}, nil
 }
 
 // ErrCap is matched by every *CapError.
@@ -90,13 +99,34 @@ type Guard struct {
 	Stat StatFunc
 }
 
+// ErrBadCap means the guard was given a cap outside (0, MaxCap]; it refuses
+// every request rather than guess (Plan 1 review, minor 9).
+var ErrBadCap = errors.New("disk guard: cap must be a finite fraction in (0, 0.95]")
+
+// MaxCap is the highest cap the guard accepts (config allows the same).
+const MaxCap = 0.95
+
+func (g Guard) validCap() error {
+	if math.IsNaN(g.Cap) || math.IsInf(g.Cap, 0) || g.Cap <= 0 || g.Cap > MaxCap {
+		return fmt.Errorf("%w (got %v)", ErrBadCap, g.Cap)
+	}
+	return nil
+}
+
 // Check returns a *CapError if adding need bytes to path's volume would take
 // usage above Cap × Total.
 func (g Guard) Check(path string, need uint64) error {
+	if err := g.validCap(); err != nil {
+		return err
+	}
 	u, err := g.Stat(path)
 	if err != nil {
 		return fmt.Errorf("statfs %s: %w", path, err)
 	}
+	return g.fits(path, u, need)
+}
+
+func (g Guard) fits(path string, u Usage, need uint64) error {
 	lim, used := limit(u, g.Cap), u.Used()
 	if u.Total == 0 || used > lim || need > lim-used {
 		return &CapError{Path: path, Usage: u, Need: need, Cap: g.Cap}
@@ -135,7 +165,7 @@ type PeakInput struct {
 	PebbleP95            float64
 	Safety               float64
 	PebbleSize           uint64
-	CanarySpill          uint64
+	DuckDBSpill          uint64  // DuckDB temp/spill limit (max_temp_directory_size), amendment A1 §7
 	RebuildExtraPerEntry float64 // derived bytes per entry for a dual-built version, 0 if none
 }
 
@@ -145,13 +175,81 @@ type Peak struct {
 	Root  uint64
 }
 
-// EstimatePeak applies the spec §10.1 formula.
+// EstimatePeak applies the spec §10.1 formula. It computes in float64 and
+// saturates at the largest uint64, so absurd inputs give a peak that can never
+// fit instead of a wrapped small number (Plan 1 review, minor 10).
 func EstimatePeak(in PeakInput) Peak {
 	n := float64(in.Entries)
 	compaction := max(uint64(MinPebbleCompactionReserve), in.PebbleSize/10)
-	return Peak{
-		Vault: uint64(math.Ceil(n*in.VaultP95*in.Safety)) + SegmentReserve,
-		Root: uint64(math.Ceil(n*(in.ParquetP95+in.PebbleP95+in.RebuildExtraPerEntry)*in.Safety)) +
-			compaction + MetadataOverhead + in.CanarySpill,
+	vault := toBytes(n*in.VaultP95*in.Safety) + SegmentReserve
+	root := toBytes(n*(in.ParquetP95+in.PebbleP95+in.RebuildExtraPerEntry)*in.Safety) +
+		float64(compaction) + MetadataOverhead + float64(in.DuckDBSpill)
+	return Peak{Vault: saturate(vault), Root: saturate(root)}
+}
+
+// toBytes rounds a non-negative byte estimate up; NaN counts as unbounded.
+func toBytes(f float64) float64 {
+	if math.IsNaN(f) {
+		return math.Inf(1)
 	}
+	return math.Ceil(max(f, 0))
+}
+
+// saturate converts to uint64, clamping anything at or beyond 2^64.
+func saturate(f float64) uint64 {
+	if f >= math.MaxUint64 {
+		return math.MaxUint64
+	}
+	return uint64(f)
+}
+
+// Target is one place a batch writes and the bytes it may need there.
+type Target struct {
+	Path string
+	Need uint64
+}
+
+// Preflight checks every target before a batch starts. Targets on the same
+// filesystem (the default vault/ folder lives on the root volume, and a dev
+// vault shares the normal disk) are summed and checked once, so two separate
+// "fits" answers can never add up to a crossed cap.
+func (g Guard) Preflight(targets []Target) error {
+	if err := g.validCap(); err != nil {
+		return err
+	}
+	type group struct {
+		paths []string
+		usage Usage
+		need  uint64
+	}
+	var order []uint64
+	groups := map[uint64]*group{}
+	for _, t := range targets {
+		u, err := g.Stat(t.Path)
+		if err != nil {
+			return fmt.Errorf("statfs %s: %w", t.Path, err)
+		}
+		gr, ok := groups[u.Dev]
+		if !ok {
+			gr = &group{usage: u}
+			groups[u.Dev] = gr
+			order = append(order, u.Dev)
+		}
+		gr.paths = append(gr.paths, t.Path)
+		gr.need = addSat(gr.need, t.Need)
+	}
+	for _, dev := range order {
+		gr := groups[dev]
+		if err := g.fits(strings.Join(gr.paths, " + "), gr.usage, gr.need); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func addSat(a, b uint64) uint64 {
+	if a > math.MaxUint64-b {
+		return math.MaxUint64
+	}
+	return a + b
 }

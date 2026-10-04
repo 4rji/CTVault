@@ -79,7 +79,7 @@ func TestP95(t *testing.T) {
 func TestEstimatePeak(t *testing.T) {
 	p := EstimatePeak(PeakInput{
 		Entries: 500000, VaultP95: 840, ParquetP95: 175, PebbleP95: 60, Safety: 1.5,
-		PebbleSize: 100 << 30, CanarySpill: 1 << 30,
+		PebbleSize: 100 << 30, DuckDBSpill: 1 << 30,
 	})
 	wantVault := uint64(500000*840*1.5) + SegmentReserve
 	wantRoot := uint64(500000*(175+60)*1.5) + 10<<30 + MetadataOverhead + 1<<30

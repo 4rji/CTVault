@@ -182,6 +182,12 @@ func (c Checker) Init(root string, opts InitOptions) (VaultID, error) {
 	if err := requireEmpty(info.Path); err != nil {
 		return VaultID{}, err
 	}
+	return createVault(info, ModeProduction, info.Durability, c.now())
+}
+
+// createVault writes the layout, vault/DIR_ID and, last, VAULT_ID. The caller
+// has already applied its mode's volume policy and checked that path is empty.
+func createVault(info Info, mode string, durability Durability, now time.Time) (VaultID, error) {
 	vaultUUID, err := NewUUID()
 	if err != nil {
 		return VaultID{}, err
@@ -200,7 +206,7 @@ func (c Checker) Init(root string, opts InitOptions) (VaultID, error) {
 		return VaultID{}, err
 	}
 	id := VaultID{
-		Format: FormatVersion, VaultUUID: vaultUUID, CreatedAt: c.now().UTC(), Durability: info.Durability,
+		Format: FormatVersion, VaultUUID: vaultUUID, Mode: mode, CreatedAt: now.UTC(), Durability: durability,
 		Volumes: []Volume{
 			{Role: RoleRoot, Path: info.Path, FSUUID: info.FSUUID, FSType: info.Mount.FSType},
 			{Role: RoleVaultDir, Path: "vault", DirID: dirUUID, FSUUID: info.FSUUID, FSType: info.Mount.FSType},
@@ -220,24 +226,78 @@ func (c Checker) Check(root string) (VaultID, error) {
 	if err != nil {
 		return VaultID{}, volErr("%s is not an initialized CTVault root (%v)", info.Path, err)
 	}
-	for _, v := range id.Volumes {
-		switch v.Role {
-		case RoleRoot:
-			if err := requireUsable(info, InitOptions{AllowUntestedFS: id.Durability == DurabilityUntested}, true); err != nil {
-				return id, err
-			}
-			if v.FSUUID != info.FSUUID || v.FSType != info.Mount.FSType {
-				return id, volErr("%s is filesystem %s (%s) but VAULT_ID records %s (%s)", info.Path, info.FSUUID, info.Mount.FSType, v.FSUUID, v.FSType)
-			}
-		case RoleVaultDir:
-			if err := c.checkDir(info.Path, id, v); err != nil {
-				return id, err
-			}
-		default:
-			return id, volErr("VAULT_ID has unknown volume role %q", v.Role)
+	if err := requireMode(info.Path, id, ModeProduction); err != nil {
+		return id, err
+	}
+	// The root checks run whatever VAULT_ID says (Plan 1 review, minor 6).
+	if err := requireUsable(info, InitOptions{AllowUntestedFS: id.Durability == DurabilityUntested}, true); err != nil {
+		return id, err
+	}
+	rootVol, dirs, err := splitVolumes(id)
+	if err != nil {
+		return id, err
+	}
+	if rootVol.FSUUID != info.FSUUID || rootVol.FSType != info.Mount.FSType {
+		return id, volErr("%s is filesystem %s (%s) but VAULT_ID records %s (%s)", info.Path, info.FSUUID, info.Mount.FSType, rootVol.FSUUID, rootVol.FSType)
+	}
+	if err := checkLayout(c.Probe, info); err != nil {
+		return id, err
+	}
+	for _, v := range dirs {
+		if err := c.checkDir(info.Path, id, v); err != nil {
+			return id, err
 		}
 	}
 	return id, nil
+}
+
+// splitVolumes requires exactly one root volume and at least one vault dir.
+func splitVolumes(id VaultID) (Volume, []Volume, error) {
+	var roots, dirs []Volume
+	for _, v := range id.Volumes {
+		switch v.Role {
+		case RoleRoot:
+			roots = append(roots, v)
+		case RoleVaultDir:
+			dirs = append(dirs, v)
+		default:
+			return Volume{}, nil, volErr("VAULT_ID has unknown volume role %q", v.Role)
+		}
+	}
+	if len(roots) != 1 {
+		return Volume{}, nil, volErr("VAULT_ID must list exactly one root volume, found %d", len(roots))
+	}
+	if len(dirs) == 0 {
+		return Volume{}, nil, volErr("VAULT_ID lists no vault directory")
+	}
+	return roots[0], dirs, nil
+}
+
+// checkLayout requires every layout folder to be a real directory on the
+// root's own filesystem, so nothing inside the vault can lead off the volume
+// (Plan 1 review, minor 7).
+func checkLayout(p Probe, root Info) error {
+	mounts, err := p.MountInfo()
+	if err != nil {
+		return fmt.Errorf("%w: reading mount table: %v", ErrVolume, err)
+	}
+	for _, d := range LayoutDirs {
+		path := filepath.Join(root.Path, d)
+		fi, err := os.Lstat(path)
+		switch {
+		case err != nil:
+			return volErr("layout folder %s is missing (%v)", path, err)
+		case fi.Mode()&fs.ModeSymlink != 0:
+			return volErr("layout folder %s is a symlink; CTVault refuses folders that may lead off the vault volume", path)
+		case !fi.IsDir():
+			return volErr("layout folder %s is not a directory", path)
+		}
+		m, ok := MountFor(mounts, path)
+		if !ok || m.MountPoint != root.Mount.MountPoint || m.MajorMinor != root.Mount.MajorMinor {
+			return volErr("layout folder %s is on a different filesystem (%s) than the vault root", path, m.MountPoint)
+		}
+	}
+	return nil
 }
 
 func (c Checker) checkDir(root string, id VaultID, v Volume) error {
@@ -255,12 +315,17 @@ func (c Checker) checkDir(root string, id VaultID, v Volume) error {
 	if vi.FSUUID != v.FSUUID {
 		return volErr("vault dir %s is filesystem %s but VAULT_ID records %s", p, vi.FSUUID, v.FSUUID)
 	}
-	d, err := ReadDirID(vi.Path)
+	return checkDirID(vi.Path, id, v)
+}
+
+// checkDirID requires dir's DIR_ID to belong to this vault and volume entry.
+func checkDirID(dir string, id VaultID, v Volume) error {
+	d, err := ReadDirID(dir)
 	if err != nil {
-		return volErr("vault dir %s has no readable %s (%v)", p, DirIDFile, err)
+		return volErr("vault dir %s has no readable %s (%v)", dir, DirIDFile, err)
 	}
 	if d.VaultUUID != id.VaultUUID || d.DirID != v.DirID {
-		return volErr("vault dir %s belongs to vault %s dir %s, not %s dir %s", p, d.VaultUUID, d.DirID, id.VaultUUID, v.DirID)
+		return volErr("vault dir %s belongs to vault %s dir %s, not %s dir %s", dir, d.VaultUUID, d.DirID, id.VaultUUID, v.DirID)
 	}
 	return nil
 }

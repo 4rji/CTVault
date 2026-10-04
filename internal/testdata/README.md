@@ -11,6 +11,7 @@ the log's current state.
 | `argon2027h1_sth1.json` | `https://ct.googleapis.com/logs/us1/argon2027h1/ct/v1/get-sth` | signed tree head, tree size 384,065,451 (06:25:33Z) |
 | `argon2027h1_sth2.json` | same endpoint, a few minutes later | signed tree head, tree size 384,071,894 |
 | `argon2027h1_consistency.json` | `get-sth-consistency?first=384065451&second=384071894` | 23-node consistency proof between the two heads |
+| `argon2027h1_entries_380000000.json` | `get-entries?start=380000000&end=380000031` (05:38Z), saved exactly as served | 32 real entries: 11 x509, 21 precert |
 
 Rules:
 

@@ -39,6 +39,8 @@ type Entry struct {
 var (
 	poisonOID  = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 11129, 2, 4, 3}
 	sctListOID = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 11129, 2, 4, 2}
+	// precertSigningEKU marks an RFC 6962 §3.1 Precertificate Signing Certificate.
+	precertSigningEKU = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 11129, 2, 4, 4}
 )
 
 func appendU24(b, data []byte) []byte {
@@ -59,8 +61,9 @@ func MerkleTreeLeaf(ts uint64, typ EntryType, certOrTBS []byte, issuerKeyHash [3
 	return binary.BigEndian.AppendUint16(b, 0)
 }
 
-// chain encodes a TLS vector<ASN.1Cert> with a 24-bit total length.
-func chain(certs ...[]byte) []byte {
+// Chain encodes a TLS vector<ASN.1Cert> with a 24-bit total length: the
+// extra_data of an x509_entry.
+func Chain(certs ...[]byte) []byte {
 	var body []byte
 	for _, c := range certs {
 		body = appendU24(body, c)
@@ -68,12 +71,21 @@ func chain(certs ...[]byte) []byte {
 	return appendU24(nil, body)
 }
 
-// Generator issues certificates from a throwaway ECDSA CA.
+// PrecertExtraData encodes the extra_data of a precert_entry: the
+// precertificate followed by its chain.
+func PrecertExtraData(precert []byte, chain ...[]byte) []byte {
+	return append(appendU24(nil, precert), Chain(chain...)...)
+}
+
+// Generator issues certificates from a throwaway ECDSA CA, and optionally
+// through a Precertificate Signing Certificate that the CA certified.
 type Generator struct {
-	caKey  *ecdsa.PrivateKey
-	ca     *x509.Certificate
-	serial int64
-	t0     time.Time
+	caKey     *ecdsa.PrivateKey
+	ca        *x509.Certificate
+	signerKey *ecdsa.PrivateKey
+	signer    *x509.Certificate
+	serial    int64
+	t0        time.Time
 }
 
 // NewGenerator creates a self-signed test CA.
@@ -96,16 +108,49 @@ func NewGenerator() (*Generator, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Generator{caKey: key, ca: ca, serial: 1, t0: t0}, nil
+	signerKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, err
+	}
+	stmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: "CTVault Test Precert Signer", Organization: []string{"CTVault Tests"}},
+		NotBefore: t0.Add(-24 * time.Hour), NotAfter: t0.Add(365 * 24 * time.Hour),
+		IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign,
+		UnknownExtKeyUsage: []asn1.ObjectIdentifier{precertSigningEKU},
+	}
+	sder, err := x509.CreateCertificate(rand.Reader, stmpl, ca, &signerKey.PublicKey, key)
+	if err != nil {
+		return nil, err
+	}
+	signer, err := x509.ParseCertificate(sder)
+	if err != nil {
+		return nil, err
+	}
+	return &Generator{caKey: key, ca: ca, signerKey: signerKey, signer: signer, serial: 2, t0: t0}, nil
 }
 
 // CADER returns the CA certificate.
 func (g *Generator) CADER() []byte { return g.ca.Raw }
 
+// SignerDER returns the Precertificate Signing Certificate.
+func (g *Generator) SignerDER() []byte { return g.signer.Raw }
+
 // Pair issues one certificate as a precert entry and its final x509 entry,
 // exactly as RFC 6962 §3.1 describes: the precert TBS with the poison
 // extension removed equals the final cert TBS without the SCT list.
 func (g *Generator) Pair(name string, ts uint64) (pre, final Entry, err error) {
+	return g.pair(name, ts, false)
+}
+
+// PairViaSigner is Pair with the precertificate issued by the Precertificate
+// Signing Certificate (RFC 6962 §3.1). The log's TBS then carries the CA's
+// issuer name and authority key ID, and the precert chain starts with the
+// signer.
+func (g *Generator) PairViaSigner(name string, ts uint64) (pre, final Entry, err error) {
+	return g.pair(name, ts, true)
+}
+
+func (g *Generator) pair(name string, ts uint64, viaSigner bool) (pre, final Entry, err error) {
 	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return pre, final, err
@@ -117,11 +162,12 @@ func (g *Generator) Pair(name string, ts uint64) (pre, final Entry, err error) {
 		NotBefore: g.t0, NotAfter: g.t0.Add(90 * 24 * time.Hour),
 		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}
-	issue := func(extra ...pkix.Extension) ([]byte, error) {
+	issueBy := func(parent *x509.Certificate, parentKey *ecdsa.PrivateKey, extra ...pkix.Extension) ([]byte, error) {
 		t := tmpl
 		t.ExtraExtensions = extra
-		return x509.CreateCertificate(rand.Reader, &t, g.ca, &leafKey.PublicKey, g.caKey)
+		return x509.CreateCertificate(rand.Reader, &t, parent, &leafKey.PublicKey, parentKey)
 	}
+	issue := func(extra ...pkix.Extension) ([]byte, error) { return issueBy(g.ca, g.caKey, extra...) }
 	plainDER, err := issue()
 	if err != nil {
 		return pre, final, err
@@ -130,7 +176,11 @@ func (g *Generator) Pair(name string, ts uint64) (pre, final Entry, err error) {
 	if err != nil {
 		return pre, final, err
 	}
-	preDER, err := issue(pkix.Extension{Id: poisonOID, Critical: true, Value: []byte{0x05, 0x00}})
+	preParent, preKey, preChain := g.ca, g.caKey, [][]byte{g.ca.Raw}
+	if viaSigner {
+		preParent, preKey, preChain = g.signer, g.signerKey, [][]byte{g.signer.Raw, g.ca.Raw}
+	}
+	preDER, err := issueBy(preParent, preKey, pkix.Extension{Id: poisonOID, Critical: true, Value: []byte{0x05, 0x00}})
 	if err != nil {
 		return pre, final, err
 	}
@@ -142,10 +192,10 @@ func (g *Generator) Pair(name string, ts uint64) (pre, final Entry, err error) {
 	ikh := sha256.Sum256(g.ca.RawSubjectPublicKeyInfo)
 	pre = Entry{Type: PrecertEntry, Timestamp: ts, CertDER: preDER, PrecertTBS: plain.RawTBSCertificate, IssuerKeyHash: ikh}
 	pre.LeafInput = MerkleTreeLeaf(ts, PrecertEntry, plain.RawTBSCertificate, ikh)
-	pre.ExtraData = append(appendU24(nil, preDER), chain(g.ca.Raw)...)
+	pre.ExtraData = PrecertExtraData(preDER, preChain...)
 	final = Entry{Type: X509Entry, Timestamp: ts + 1000, CertDER: finDER}
 	final.LeafInput = MerkleTreeLeaf(ts+1000, X509Entry, finDER, [32]byte{})
-	final.ExtraData = chain(g.ca.Raw)
+	final.ExtraData = Chain(g.ca.Raw)
 	return pre, final, nil
 }
 
@@ -164,4 +214,14 @@ func (g *Generator) Entries(n int) ([]Entry, error) {
 		}
 	}
 	return out, nil
+}
+
+// MalformedEntry returns an entry whose bytes are valid base64 but whose
+// MerkleTreeLeaf cannot be interpreted (version 1 instead of v1 = 0). It is a
+// semantic leaf error (spec §5.4): it belongs in the Merkle tree like any
+// other leaf, so a log built with it still verifies.
+func MalformedEntry(ts uint64) Entry {
+	leaf := MerkleTreeLeaf(ts, X509Entry, []byte{0x30, 0x00}, [32]byte{})
+	leaf[0] = 1
+	return Entry{Type: X509Entry, Timestamp: ts, LeafInput: leaf, ExtraData: Chain()}
 }

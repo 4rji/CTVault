@@ -16,7 +16,7 @@ func newInitCmd(a *app) *cobra.Command {
 		Short: "Create a vault on a dedicated, mounted ext4 volume",
 		Args:  usageArgs(cobra.ExactArgs(1)),
 		RunE: func(c *cobra.Command, args []string) error {
-			id, err := a.checker().Init(args[0], volume.InitOptions{AllowUntestedFS: allowUntested})
+			id, err := a.d.Volumes.Init(args[0], volume.InitOptions{AllowUntestedFS: allowUntested})
 			if err != nil {
 				return volumeErr(err)
 			}
@@ -50,7 +50,7 @@ func newVaultCmd(a *app) *cobra.Command {
 				return err
 			}
 			defer lk.Release()
-			id, err := a.checker().AddDir(root, args[0], volume.InitOptions{AllowUntestedFS: allowUntested})
+			id, err := a.d.Volumes.AddDir(root, args[0], volume.InitOptions{AllowUntestedFS: allowUntested})
 			if err != nil {
 				return volumeErr(err)
 			}

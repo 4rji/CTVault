@@ -11,6 +11,8 @@ type Durability string
 const (
 	DurabilityTested   Durability = "tested"
 	DurabilityUntested Durability = "untested"
+	// DurabilityDevUnsafe marks dev vaults on the normal disk (amendment A1 §1).
+	DurabilityDevUnsafe Durability = "dev-unsafe"
 )
 
 // ErrUnsupportedFS means the filesystem can never hold a vault.

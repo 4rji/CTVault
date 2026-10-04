@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/4rji/ctvault/internal/exitcode"
+	"github.com/4rji/ctvault/internal/volume"
 	"github.com/4rji/ctvault/internal/volume/volumetest"
 )
 
@@ -52,9 +53,11 @@ func newEnv(t *testing.T, sthBody []byte) *env {
 	t.Cleanup(srv.Close)
 	target, _ := url.Parse(srv.URL)
 	e := &env{t: t, probe: p, root: root, stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}}
+	now := func() time.Time { return time.Date(2026, 10, 4, 7, 0, 0, 0, time.UTC) }
 	e.deps = Deps{
-		Probe: p, HTTP: &http.Client{Transport: rewrite{target}}, Getenv: func(string) string { return "" },
-		Now:    func() time.Time { return time.Date(2026, 10, 4, 7, 0, 0, 0, time.UTC) },
+		Volumes: volume.Checker{Probe: p, Now: now},
+		HTTP:    &http.Client{Transport: rewrite{target}}, Getenv: func(string) string { return "" },
+		Now:    now,
 		Stdout: e.stdout, Stderr: e.stderr, LogListSource: logList, Version: "test",
 	}
 	return e

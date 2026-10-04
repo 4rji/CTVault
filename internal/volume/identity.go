@@ -41,9 +41,35 @@ type Volume struct {
 type VaultID struct {
 	Format     int        `json:"format"`
 	VaultUUID  string     `json:"vault_uuid"`
+	Mode       string     `json:"mode"` // ModeProduction or ModeDev; empty (Plan 1 vaults) means production
 	CreatedAt  time.Time  `json:"created_at"`
 	Durability Durability `json:"durability"`
 	Volumes    []Volume   `json:"volumes"`
+}
+
+// Vault modes (amendment A1 §1). A production binary only opens production
+// vaults; a ctvault_dev binary only opens dev vaults.
+const (
+	ModeProduction = "production"
+	ModeDev        = "dev"
+)
+
+// requireMode refuses a vault whose mode is not want.
+func requireMode(root string, id VaultID, want string) error {
+	mode := id.Mode
+	if mode == "" {
+		mode = ModeProduction
+	}
+	switch {
+	case mode == want:
+		return nil
+	case mode == ModeDev:
+		return volErr("%s is a dev vault created by a ctvault_dev build; the production binary refuses it", root)
+	case mode == ModeProduction:
+		return volErr("%s is a production vault; the ctvault_dev build refuses it", root)
+	default:
+		return volErr("%s has unknown vault mode %q", root, id.Mode)
+	}
 }
 
 // DirID is the content of <vault dir>/DIR_ID.
