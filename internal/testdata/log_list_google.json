@@ -1,0 +1,114 @@
+{
+  "version": "93.3",
+  "log_list_timestamp": "2026-10-03T13:35:24Z",
+  "operators": [
+    {
+      "name": "Google",
+      "email": [
+        "google-ct-logs@googlegroups.com"
+      ],
+      "logs": [
+        {
+          "description": "Google 'Argon2026h2' log",
+          "log_id": "1219ENGn9XfCx+lf1wC/+YLJM1pl4dCzAXMXwMjFaXc=",
+          "key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEKjpni/66DIYrSlGK6Rf+e6F2c/28ZUvDJ79N81+gyimAESAyeNZ++TRgjHWg9TVQnKHTSU0T1TtqDupFnSQTIg==",
+          "url": "https://ct.googleapis.com/logs/us1/argon2026h2/",
+          "mmd": 86400,
+          "state": {
+            "usable": {
+              "timestamp": "2024-09-30T22:19:27Z"
+            }
+          },
+          "temporal_interval": {
+            "start_inclusive": "2026-07-01T00:00:00Z",
+            "end_exclusive": "2027-01-01T00:00:00Z"
+          }
+        },
+        {
+          "description": "Google 'Argon2027h1'",
+          "log_id": "1tWNqdAXU/NqSqDHV0kCr+vH3CzTjNn3ZMgMiRkenwI=",
+          "key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEKHRm0H/zUaFA6Idz5cGvGO3tCPQyfGMgJmVBOPyKAP6mGM1IiNXi4CLomOUyYj0YN74p+eGVApFMsM4h/jzCsA==",
+          "url": "https://ct.googleapis.com/logs/us1/argon2027h1/",
+          "mmd": 86400,
+          "state": {
+            "usable": {
+              "timestamp": "2025-12-28T00:30:00Z"
+            }
+          },
+          "temporal_interval": {
+            "start_inclusive": "2027-01-01T00:00:00Z",
+            "end_exclusive": "2027-07-01T00:00:00Z"
+          }
+        },
+        {
+          "description": "Google 'Xenon2026h2' log",
+          "log_id": "2AlVO5RPev/IFhlvlE+Fq7D4/F6HVSYPFdEucrtFSxQ=",
+          "key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE5Xd4lXEos5XJpcx6TOgyA5Z7/C4duaTbQ6C9aXL5Rbqaw+mW1XDnDX7JlRUninIwZYZDU9wRRBhJmCVopzwFvw==",
+          "url": "https://ct.googleapis.com/logs/eu1/xenon2026h2/",
+          "mmd": 86400,
+          "state": {
+            "usable": {
+              "timestamp": "2024-09-30T22:19:27Z"
+            }
+          },
+          "temporal_interval": {
+            "start_inclusive": "2026-07-01T00:00:00Z",
+            "end_exclusive": "2027-01-01T00:00:00Z"
+          }
+        },
+        {
+          "description": "Google 'Xenon2027h1'",
+          "log_id": "RMK9DOkUDmSlyUoBkwpaobs1lw4A7hEWiWgqHETXtWY=",
+          "key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE/6WcA4VRSljIfTdY48+pFRLLtLrmTb88cGDdl8Gv3E2LduG4jgJ3AK5iNMFGhpbRRLi5B3rPlBaXVywuR5IFDg==",
+          "url": "https://ct.googleapis.com/logs/eu1/xenon2027h1/",
+          "mmd": 86400,
+          "state": {
+            "usable": {
+              "timestamp": "2025-12-28T00:30:00Z"
+            }
+          },
+          "temporal_interval": {
+            "start_inclusive": "2027-01-01T00:00:00Z",
+            "end_exclusive": "2027-07-01T00:00:00Z"
+          }
+        }
+      ],
+      "tiled_logs": [
+        {
+          "description": "Google 'ParcelYard2027h1' log",
+          "log_id": "HIl0B+YBCgEpO7Z439ejaM6xjMpSHcyk04bkoy5bXQQ=",
+          "key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEX7i7gYwmBxpiLXAlM/VLk4BFzspJRmZA86iReO7NVRlwGL1KWb/Dv5DRXJNBZd+9uREkNUTee5yBy2dRdRGa0w==",
+          "submission_url": "https://parcelyard2027h1.prod.certificate.transparency.goog/",
+          "monitoring_url": "https://storage.googleapis.com/parcelyard2027h1.prod.certificate.transparency.goog/",
+          "mmd": 60,
+          "state": {
+            "usable": {
+              "timestamp": "2026-08-31T13:50:00Z"
+            }
+          },
+          "temporal_interval": {
+            "start_inclusive": "2027-01-01T00:00:00Z",
+            "end_exclusive": "2027-07-01T00:00:00Z"
+          }
+        },
+        {
+          "description": "Google 'PlumbersArms2027h1' log",
+          "log_id": "X/nA+6QtrHjOZELrGazggaKb1OL7U68MYzB55QWCBMk=",
+          "key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEAKYYdjIeQwDP0RIY9mhAVntX5s2ObMc2F6u8cELSbhvavljWD/OesJZHUtqQjBXE5Ekbpiq6nchmaVnEHHpJmw==",
+          "submission_url": "https://plumbersarms2027h1.prod.certificate.transparency.goog/",
+          "monitoring_url": "https://storage.googleapis.com/plumbersarms2027h1.prod.certificate.transparency.goog/",
+          "mmd": 60,
+          "state": {
+            "usable": {
+              "timestamp": "2026-08-31T13:50:00Z"
+            }
+          },
+          "temporal_interval": {
+            "start_inclusive": "2027-01-01T00:00:00Z",
+            "end_exclusive": "2027-07-01T00:00:00Z"
+          }
+        }
+      ]
+    }
+  ]
+}

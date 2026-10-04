@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Real CT fixtures are immutable test data: never convert line endings.
+internal/testdata/** -text
