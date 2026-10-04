@@ -87,8 +87,9 @@ keeps the same 85% disk cap, applied to the normal disk.
 ```
 
 - `--entries` is 50,000-500,000 and a multiple of 5,000; `--start` is a
-  multiple of 5,000. A 100,000-entry sample takes about 76-90 MB (760-900 B
-  per entry measured) and a few minutes at the log's rate limit.
+  multiple of 5,000. A 100,000-entry sample takes about 76-100 MB (760-974 B
+  per entry measured; the canonical `[0, 100000)` window took 97.5 MB) and
+  about 4 minutes at the log's rate limit.
 - A sample is published only after it verifies: the file checksums, the
   signed head with the key pinned from Chrome's log list, and the Merkle
   proofs that tie every entry's `leaf_input` (the logged certificate or
