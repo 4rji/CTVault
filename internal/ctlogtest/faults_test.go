@@ -7,7 +7,10 @@ import (
 	"encoding/asn1"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
 	"runtime"
 	"sync"
@@ -34,6 +37,20 @@ func TestNoRetryAfter(t *testing.T) {
 	resp, _ := get(t, l.URL+"ct/v1/get-sth")
 	if resp.StatusCode != 429 || resp.Header.Get("Retry-After") != "" {
 		t.Fatalf("want a 429 without Retry-After, got %d %q", resp.StatusCode, resp.Header.Get("Retry-After"))
+	}
+}
+
+// TestTruncateBodyEvery: the response promises more bytes than arrive, as
+// when a connection drops mid-body.
+func TestTruncateBodyEvery(t *testing.T) {
+	l := New(t, 8, Options{TruncateBodyEvery: 1})
+	resp, err := http.Get(l.URL + "ct/v1/get-entries?start=0&end=7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if _, err := io.ReadAll(resp.Body); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("reading a cut body: %v, want unexpected EOF", err)
 	}
 }
 

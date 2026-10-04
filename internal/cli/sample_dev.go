@@ -14,6 +14,7 @@ import (
 	"github.com/4rji/ctvault/internal/diskguard"
 	"github.com/4rji/ctvault/internal/exitcode"
 	"github.com/4rji/ctvault/internal/fetch"
+	"github.com/4rji/ctvault/internal/fsutil"
 	"github.com/4rji/ctvault/internal/loglist"
 	"github.com/4rji/ctvault/internal/logreg"
 	"github.com/4rji/ctvault/internal/logsource"
@@ -93,9 +94,14 @@ func sampleCaptureCmd(a *app) *cobra.Command {
 			}
 			opts.Key, opts.LogListVersion = rec.Key, rec.LogListVersion
 
+			// On a fresh machine the dev base does not exist yet; create the
+			// samples folder (inside the base) so the disk check can stat it.
 			samples := filepath.Join(a.d.DevBase, "samples")
+			if err := fsutil.MkdirAllSync(samples, 0o700); err != nil {
+				return err
+			}
 			guard := diskguard.Guard{Cap: o.Disk.MaxUsedFraction, Stat: a.d.Statfs}
-			opts.Check = func(need int64) error { return guard.Check(a.d.DevBase, uint64(need)) }
+			opts.Check = func(need int64) error { return guard.Check(samples, uint64(need)) }
 			errOut := c.ErrOrStderr()
 			opts.Progress = func(done, total uint64) { fmt.Fprintf(errOut, "fetched %d / %d entries\n", done, total) }
 

@@ -59,6 +59,15 @@ func TestGetEntriesFramingErrors(t *testing.T) {
 	}
 }
 
+// TestTruncatedBodyIsFramingError: a connection dropped mid-body is spec
+// §5.4's "truncated body", transport corruption that must be retried.
+func TestTruncatedBodyIsFramingError(t *testing.T) {
+	l := ctlogtest.New(t, 8, ctlogtest.Options{TruncateBodyEvery: 1})
+	if _, err := New(l.URL, nil).GetEntries(ctx, 0, 7); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("want ErrMalformed, got %v", err)
+	}
+}
+
 func TestGetProofByHash(t *testing.T) {
 	l := ctlogtest.New(t, 21, ctlogtest.Options{})
 	c := New(l.URL, nil)

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 
@@ -39,7 +40,8 @@ type Sample struct {
 
 // Open loads and fully verifies the sample in dir (amendment A1 §2.4):
 // file checksums, the signed head with the pinned key, every entry, and the
-// Merkle proofs that tie the entries to the signed root.
+// Merkle proofs that tie every leaf_input to the signed root. extra_data is
+// not part of a CT log's Merkle tree, so only the checksums protect it.
 func Open(dir string) (*Sample, error) {
 	s, err := load(dir)
 	if err != nil {
@@ -75,6 +77,9 @@ func load(dir string) (*Sample, error) {
 	for _, name := range []string{EntriesFile, ProofsFile} {
 		want, ok := m.Files[name]
 		got, err := fileSum(filepath.Join(dir, name))
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, corrupt("%s is missing (an incomplete copy?)", name)
+		}
 		if err != nil {
 			return nil, err
 		}

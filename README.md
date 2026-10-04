@@ -91,7 +91,12 @@ keeps the same 85% disk cap, applied to the normal disk.
   per entry measured) and a few minutes at the log's rate limit.
 - A sample is published only after it verifies: the file checksums, the
   signed head with the key pinned from Chrome's log list, and the Merkle
-  proofs that tie every entry to that head. It is then read-only and never
+  proofs that tie every entry's `leaf_input` (the logged certificate or
+  precertificate TBS and its timestamp) to that head.
+- The chains in `extra_data` are not part of a CT log's Merkle tree (RFC
+  6962), so no proof covers them; in a sample they are protected by the
+  checksums only. Precertificate cross-checks still flag a chain that does
+  not match the logged TBS. It is then read-only and never
   overwritten; to capture the same range again, add `--suffix <name>`.
 - An interrupted or failed capture (Ctrl-C, network loss, full disk) leaves
   nothing behind.

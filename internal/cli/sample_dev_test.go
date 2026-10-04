@@ -75,6 +75,34 @@ func TestSampleCaptureAndVerify(t *testing.T) {
 	}
 }
 
+// TestSampleCaptureCreatesTheDevBase: on a fresh machine ~/.cache/ctvault-dev
+// does not exist yet. The first capture must create it rather than fail its
+// disk check, which stats the folder.
+func TestSampleCaptureCreatesTheDevBase(t *testing.T) {
+	e, _ := sampleEnv(t, 0.5)
+	fake := e.deps.Statfs
+	home := t.TempDir()
+	t.Cleanup(func() { // runs before home's removal: published samples are read-only
+		filepath.WalkDir(home, func(p string, d os.DirEntry, err error) error {
+			if err == nil && d.IsDir() {
+				os.Chmod(p, 0o755)
+			}
+			return nil
+		})
+	})
+	e.deps.DevBase = filepath.Join(home, ".cache", "ctvault-dev")
+	e.deps.Statfs = func(p string) (diskguard.Usage, error) { // like statfs(2): a missing path fails
+		if _, err := os.Stat(p); err != nil {
+			return diskguard.Usage{}, err
+		}
+		return fake(p)
+	}
+	e.mustRun("sample", "capture", "--log", "fakelog", "--entries", "16")
+	if _, err := os.Stat(filepath.Join(e.deps.DevBase, "samples", "fakelog", "000000000000-000000000015", sample.ManifestFile)); err != nil {
+		t.Fatalf("the sample must be published under the new dev base: %v", err)
+	}
+}
+
 func TestSampleCaptureRefusals(t *testing.T) {
 	e, l := sampleEnv(t, 0.5)
 	for _, tc := range []struct {
@@ -120,5 +148,16 @@ func TestSampleVerifyRefusesDamage(t *testing.T) {
 	os.WriteFile(p, b, 0o644)
 	if code := e.run("sample", "verify", dir); code != exitcode.Verification {
 		t.Fatalf("a damaged sample: exit %d, want %d: %s", code, exitcode.Verification, e.stderr)
+	}
+}
+
+func TestSampleVerifyRefusesAPartialCopy(t *testing.T) {
+	e, _ := sampleEnv(t, 0.5)
+	e.mustRun("sample", "capture", "--log", "fakelog", "--entries", "16")
+	dir := filepath.Join(e.deps.DevBase, "samples", "fakelog", "000000000000-000000000015")
+	os.Chmod(dir, 0o755)
+	os.Remove(filepath.Join(dir, sample.ProofsFile))
+	if code := e.run("sample", "verify", dir); code != exitcode.Verification {
+		t.Fatalf("a sample missing %s: exit %d, want %d: %s", sample.ProofsFile, code, exitcode.Verification, e.stderr)
 	}
 }

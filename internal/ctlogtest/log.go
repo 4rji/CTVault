@@ -30,6 +30,7 @@ type Options struct {
 	ServerErrorEvery   int  // any endpoint answers 503 (no Retry-After)
 	ShortReadEvery     int  // get-entries returns half of what it would have
 	CorruptJSONEvery   int  // get-entries returns truncated JSON
+	TruncateBodyEvery  int  // get-entries promises a full body, sends half, then drops the connection
 	InvalidBase64Every int  // get-entries returns an invalid base64 leaf_input
 	BadSTHSignature    bool
 	AlterEntries       []uint64 // these indices are served with a modified leaf_input
@@ -297,6 +298,18 @@ func (l *Log) getEntries(w http.ResponseWriter, r *http.Request) {
 	}
 	if every(l.opts.InvalidBase64Every, n) {
 		out[0].LeafInput = "!!not-base64!!"
+	}
+	if every(l.opts.TruncateBodyEvery, n) {
+		b, _ := json.Marshal(map[string]any{"entries": out})
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", strconv.Itoa(len(b)))
+		w.WriteHeader(http.StatusOK)
+		w.Write(b[:len(b)/2])
+		w.(http.Flusher).Flush()
+		if conn, _, err := w.(http.Hijacker).Hijack(); err == nil {
+			conn.Close()
+		}
+		return
 	}
 	if every(l.opts.CorruptJSONEvery, n) {
 		b, _ := json.Marshal(map[string]any{"entries": out})

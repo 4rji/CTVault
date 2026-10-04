@@ -86,6 +86,20 @@ func TestRunRetriesThrottlingAndFraming(t *testing.T) {
 	}
 }
 
+// TestRunRetriesTruncatedBodies: one dropped connection must not end a
+// capture or a batch; the request is fetched again.
+func TestRunRetriesTruncatedBodies(t *testing.T) {
+	l := ctlogtest.New(t, 64, ctlogtest.Options{PageSize: 8, TruncateBodyEvery: 3})
+	st := collect(t, l, 0, 64, fast(Options{Workers: 2, PageSize: 8}))
+	if st.FramingErrors == 0 {
+		t.Fatalf("truncated bodies must have been hit and retried: %+v", st)
+	}
+	_, err := rfc6962.New(ctlogtest.New(t, 8, ctlogtest.Options{TruncateBodyEvery: 1}).URL, nil).GetEntries(context.Background(), 0, 7)
+	if err == nil || !Transient(err) {
+		t.Fatalf("Retry must treat a truncated body as transient: %v", err)
+	}
+}
+
 func TestRetryAfterPausesTheRun(t *testing.T) {
 	l := ctlogtest.New(t, 24, ctlogtest.Options{PageSize: 8, RateLimitEvery: 2})
 	t0 := time.Now()

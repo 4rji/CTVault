@@ -83,7 +83,7 @@ These failure modes are implied by the spec but untested by its own examples. Th
    - Expected: no sample folder and no staging leftovers. A rerun works.
    - Pinned by `TestCaptureNeverOverwritesAndLeavesNothingOnFailure` and `TestDiskCheckAbortsCapture` (Task A7), and `TestSampleCaptureRespectsTheDiskCap` (Task A8).
 4. **A cached sample is damaged later** (bit rot, a hand edit, a partial copy).
-   - Expected: it is refused with exit 5 and never replayed. A consistent forgery that updates the checksums still fails the Merkle proofs.
+   - Expected: it is refused with exit 5 and never replayed. A consistent forgery of `leaf_input` that updates the checksums still fails the Merkle proofs. (`extra_data` is not in a CT log's Merkle tree, so a forged chain with updated checksums is not detectable; corrected after the final review.)
    - Pinned by `TestOpenDetectsTampering` and `TestCommitRefusesEntriesThatDoNotMatchTheProofs` (Task A7), and `TestSampleVerifyRefusesDamage` (Task A8).
 5. **A precertificate's chain is out of order, repeats a certificate, carries a same-name impostor, or goes through a precertificate signing certificate.**
    - Expected: the issuer is found by relationship; an ambiguity is flagged, never guessed.

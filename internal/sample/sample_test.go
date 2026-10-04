@@ -321,6 +321,24 @@ func TestOpenDetectsTampering(t *testing.T) {
 	}
 }
 
+// TestOpenRefusesAPartialCopy: an interrupted copy can leave a manifest
+// whose listed files are missing. That is a damaged sample (ErrCorrupt, exit
+// 5), not an ordinary I/O error.
+func TestOpenRefusesAPartialCopy(t *testing.T) {
+	f := newFixture(t, 120)
+	s, err := f.capture(t, Canonical, 0, 16, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, missing := range []string{EntriesFile, ProofsFile} {
+		dir := copyWritable(t, s)
+		os.Remove(filepath.Join(dir, missing))
+		if _, err := Open(dir); !errors.Is(err, ErrCorrupt) {
+			t.Errorf("%s missing: want ErrCorrupt, got %v", missing, err)
+		}
+	}
+}
+
 // TestCommitRefusesEntriesThatDoNotMatchTheProofs: an entry changed before
 // publishing (new checksums and all) fails the Merkle check, and nothing is
 // published.

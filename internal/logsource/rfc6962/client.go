@@ -85,7 +85,9 @@ func (c *Client) getJSON(ctx context.Context, path string, q url.Values, v any) 
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
 	if err != nil {
-		return nil, fmt.Errorf("%s: reading body: %w", u, err)
+		// A body cut short (dropped connection, HTTP/2 stream reset) is
+		// transport corruption (spec §5.4): retried, never fatal.
+		return nil, fmt.Errorf("%w: %s: reading body: %w", ErrMalformed, u, err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		he := &HTTPError{URL: u, Status: resp.StatusCode, Body: strings.TrimSpace(string(body[:min(len(body), 200)]))}

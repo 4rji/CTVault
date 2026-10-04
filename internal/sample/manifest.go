@@ -7,7 +7,8 @@
 //	sample.json          the manifest (Manifest)
 //	entries.ndjson.zst   one JSON line per entry, {"i", "leaf_input", "extra_data"}, bytes exactly
 //	                     as served; one zstd frame per Boundary entries, offsets in Manifest.Frames
-//	proofs.json          the Merkle proofs that authenticate the entries against the signed head
+//	proofs.json          the Merkle proofs that authenticate every entry's leaf_input against the
+//	                     signed head (extra_data is not in the Merkle tree; checksums protect it)
 package sample
 
 import (
