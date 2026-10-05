@@ -66,6 +66,29 @@ var Codes = []Code{BadVersion, BadLeafType, UnknownEntryType, Truncated, Trailin
 	ExtraTruncated, ExtraTrailingBytes, ChainCertEmpty, ChainIssuerMissing, ChainIssuerAmbiguous,
 	IssuerKeyHashMismatch, PrecertTBSMismatch, IssuanceKeyUnavailable}
 
+var explanations = map[Code]string{
+	BadVersion:       "The MerkleTreeLeaf version is not v1 (0). The entry is kept in entries with its leaf hash, but no certificate can be read from it.",
+	BadLeafType:      "The MerkleTreeLeaf type is not timestamped_entry. No certificate can be read from it.",
+	UnknownEntryType: "The TimestampedEntry type is neither x509_entry nor precert_entry. No certificate can be read from it.",
+	Truncated:        "leaf_input ends before its fields do. No certificate can be read from it.",
+	TrailingBytes:    "Bytes follow the MerkleTreeLeaf in leaf_input. No certificate is read from it.",
+
+	ExtraTruncated:     "extra_data ends before its fields do; the chain is not recorded.",
+	ExtraTrailingBytes: "Bytes follow the chain in extra_data; the chain is not recorded.",
+	ChainCertEmpty:     "extra_data holds an empty chain certificate; the chain is not recorded.",
+
+	ChainIssuerMissing:   "No certificate in the chain issued the precertificate (amendment A1 §4: subject equals issuer, and key IDs match when present).",
+	ChainIssuerAmbiguous: "More than one chain certificate could have issued the precertificate.",
+
+	IssuerKeyHashMismatch:  "The precert entry's issuer_key_hash differs from the SHA-256 of the issuer's SubjectPublicKeyInfo.",
+	PrecertTBSMismatch:     "The precert entry's TBSCertificate differs from the precertificate's with the poison removed (and the issuer replaced when a precert-signing certificate is used).",
+	IssuanceKeyUnavailable: "The issuance key (which links a precert to its final certificate) cannot be computed for this entry.",
+}
+
+// Explain returns the code's explanation for explain-error, or "" for OK
+// or an unknown code.
+func (c Code) Explain() string { return explanations[c] }
+
 // LeafStructure reports whether c means leaf_input itself could not be
 // interpreted. Such entries have no certificate (spec §5.4: null cert_id).
 func (c Code) LeafStructure() bool {
