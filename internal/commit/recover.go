@@ -2,11 +2,15 @@ package commit
 
 import (
 	"crypto/sha256"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/4rji/ctvault/internal/dataset"
+	"github.com/4rji/ctvault/internal/fsutil"
 	"github.com/4rji/ctvault/internal/index"
 	"github.com/4rji/ctvault/internal/vault"
 )
@@ -15,6 +19,7 @@ import (
 type RecoverOptions struct {
 	Paths     Paths
 	VaultDirs []string
+	VaultUUID [16]byte // every segment header must carry it
 	Index     *index.Index
 	Codec     *vault.Codec // with every dictionary loaded
 	// ChainIDs reads the chain_id column of a committed chains.parquet.
@@ -44,10 +49,16 @@ func (r Recovered) LastSeq() uint64 {
 //  1. Committed batches are read and checked; a damaged one is corruption.
 //  2. Vault data beyond the committed tail lifts ID_FLOOR above every
 //     cert_id seen there, then is truncated.
-//  3. Intents of committed batches are dropped; intents of uncommitted
-//     batches lose their staging directory, then the intent.
-//  4. Only tmp/stage/* and tmp/rebuild/* are cleaned (amendment A1 §7).
-//  5. Pebble catches up on committed batches it has not applied, by
+//  3. Intents of committed batches are dropped; uncommitted batches lose
+//     their staging directory, and their intents stay, marked abandoned,
+//     until a later batch commits: every start until then resumes cert_id
+//     allocation at ID_FLOOR, even if the writer that recovered stops
+//     before committing anything (spec §8.6: IDs are never reused).
+//  4. Only tmp/stage/* and tmp/rebuild/* are cleaned (amendment A1 §7),
+//     plus the temp files of interrupted atomic writes in the vault's
+//     metadata folders.
+//  5. Every committed segment must exist and carry this vault's UUID.
+//  6. Pebble catches up on committed batches it has not applied, by
 //     re-reading their vault ranges and chains.parquet; this is idempotent.
 func Recover(o RecoverOptions) (Recovered, error) {
 	var r Recovered
@@ -119,15 +130,21 @@ func Recover(o RecoverOptions) (Recovered, error) {
 	for _, in := range intents {
 		if _, err := os.Stat(filepath.Join(o.Paths.BatchDir(in.ID()), ManifestFile)); err == nil {
 			r.Actions = append(r.Actions, "batch "+in.BatchID+" was committed; finishing it")
-		} else {
-			r.Crashed = true
-			if err := os.RemoveAll(o.Paths.StageDir(in.ID())); err != nil {
+			if err := RemoveIntent(o.Paths, in.ID(), nil); err != nil {
+				return r, err
+			}
+			continue
+		}
+		r.Crashed = true
+		if err := os.RemoveAll(o.Paths.StageDir(in.ID())); err != nil {
+			return r, err
+		}
+		if !in.Abandoned {
+			in.Abandoned = true
+			if err := WriteIntent(o.Paths, in, nil); err != nil {
 				return r, err
 			}
 			r.Actions = append(r.Actions, "abandoned uncommitted batch "+in.BatchID)
-		}
-		if err := RemoveIntent(o.Paths, in.ID(), nil); err != nil {
-			return r, err
 		}
 	}
 
@@ -140,6 +157,14 @@ func Recover(o RecoverOptions) (Recovered, error) {
 			}
 			r.Actions = append(r.Actions, "removed leftover tmp/"+sub+"/"+e.Name())
 		}
+	}
+
+	if err := removeInterruptedWrites(o, &r); err != nil {
+		return r, err
+	}
+
+	if err := vault.CheckSegments(o.VaultDirs, o.VaultUUID, r.Tail); err != nil {
+		return r, err
 	}
 
 	if err := catchUp(o, committed, &r); err != nil {
@@ -213,6 +238,58 @@ func catchUp(o RecoverOptions, committed []Manifest, r *Recovered) error {
 		}
 		applied[m.Log] = m.CommitSeq
 		r.Actions = append(r.Actions, "re-applied batch "+m.BatchID+" to the index")
+	}
+	return nil
+}
+
+// removeInterruptedWrites deletes what a writer killed inside
+// fsutil.WriteFileAtomic leaves behind: ".<name>.tmp-<digits>" files in the
+// root (views.sql), state/ and its folders (intents, ID_FLOOR, heads, log
+// records, incidents) and each vault folder's dict/. Pebble's folder and
+// every other name are left alone. The writer lock excludes every other
+// writer of these folders.
+func removeInterruptedWrites(o RecoverOptions, r *Recovered) error {
+	root, state := o.Paths.Root, o.Paths.StateDir()
+	dirs := []string{root}
+	err := filepath.WalkDir(state, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if p == filepath.Join(state, "pebble") {
+				return filepath.SkipDir
+			}
+			dirs = append(dirs, p)
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	for _, v := range o.VaultDirs {
+		dirs = append(dirs, filepath.Join(v, "dict"))
+	}
+	for _, dir := range dirs {
+		es, err := os.ReadDir(dir)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		for _, e := range es {
+			if !e.Type().IsRegular() || !fsutil.IsAtomicTemp(e.Name()) {
+				continue
+			}
+			p := filepath.Join(dir, e.Name())
+			if err := os.Remove(p); err != nil {
+				return err
+			}
+			if rel, err := filepath.Rel(root, p); err == nil && !strings.HasPrefix(rel, "..") {
+				p = rel
+			}
+			r.Actions = append(r.Actions, "removed the leftover of an interrupted write: "+p)
+		}
 	}
 	return nil
 }

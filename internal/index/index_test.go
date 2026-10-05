@@ -1,6 +1,10 @@
 package index
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"maps"
+	"path/filepath"
 	"testing"
 
 	"github.com/4rji/ctvault/internal/vault"
@@ -82,5 +86,41 @@ func TestRefEncoding(t *testing.T) {
 	}
 	if _, err := decodeRef([]byte{0x80}); err == nil {
 		t.Fatal("a truncated varint is malformed")
+	}
+}
+
+// TestEachCert lists every certificate entry in SHA-256 order, and only
+// those: chain and applied keys are skipped.
+func TestEachCert(t *testing.T) {
+	x, err := Open(filepath.Join(t.TempDir(), "pebble"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer x.Close()
+	b := x.NewBatch()
+	want := map[[32]byte]Ref{}
+	for i := range 5 {
+		sha := sha256.Sum256([]byte{byte(i)})
+		r := Ref{CertID: uint64(i + 1), Loc: vault.Loc{Segment: 1, Offset: uint64(64 + 100*i), Len: 100}}
+		b.AddCert(sha, r)
+		want[sha] = r
+	}
+	b.AddChain(sha256.Sum256([]byte("chain")))
+	b.SetApplied("fakelog", 3)
+	if err := b.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	b.Close()
+	got := map[[32]byte]Ref{}
+	var prev [32]byte
+	err = x.EachCert(func(sha [32]byte, r Ref) error {
+		if bytes.Compare(sha[:], prev[:]) <= 0 {
+			t.Fatalf("not in SHA-256 order: %x after %x", sha[:4], prev[:4])
+		}
+		prev, got[sha] = sha, r
+		return nil
+	})
+	if err != nil || !maps.Equal(got, want) {
+		t.Fatalf("EachCert: %v, %d entries, want %d", err, len(got), len(want))
 	}
 }

@@ -34,6 +34,9 @@ import (
 // abandons the batch and is returned as is (a stall, a full disk, a second
 // signal). The caller resets src's chain cache after every call.
 func (w *Writer) Batch(ctx context.Context, src logsource.LogSource, sth logsource.SignedHead, first, end uint64) (commit.Manifest, error) {
+	if w.broken != nil {
+		return commit.Manifest{}, w.broken
+	}
 	m, err := w.attempt(ctx, src, sth, first, end)
 	var firstTry, secondTry errRetry
 	if !errors.As(err, &firstTry) {
@@ -69,12 +72,37 @@ type batch struct {
 	counts  commit.Counts
 	firstID uint64
 	lastID  uint64
-	samples []sample
+	samples *reservoir // vault records the canary reads back
 }
 
 type sample struct {
 	sha [32]byte
 	loc vault.Loc
+}
+
+// canaryReservoir is how many new vault records a batch keeps for the
+// canary to choose from.
+const canaryReservoir = 4096
+
+// reservoir keeps a uniform random sample of a stream (Algorithm R), so the
+// canary reads records from the whole batch, not only its start.
+type reservoir struct {
+	items []sample
+	seen  int
+	rnd   *rand.Rand
+}
+
+func newReservoir(n int, seed1, seed2 uint64) *reservoir {
+	return &reservoir{items: make([]sample, 0, n), rnd: rand.New(rand.NewPCG(seed1, seed2))}
+}
+
+func (r *reservoir) add(s sample) {
+	r.seen++
+	if len(r.items) < cap(r.items) {
+		r.items = append(r.items, s)
+	} else if j := r.rnd.IntN(r.seen); j < len(r.items) {
+		r.items[j] = s
+	}
 }
 
 func (w *Writer) attempt(ctx context.Context, src logsource.LogSource, sth logsource.SignedHead, first, end uint64) (commit.Manifest, error) {
@@ -87,18 +115,25 @@ func (w *Writer) attempt(ctx context.Context, src logsource.LogSource, sth logso
 	if tip.State != nil {
 		state = tip.State.Clone()
 	}
-	// P0: volume checks, dictionary training, then the disk-guard peak
-	// preflight.
+	// P0: volume checks, the disk-guard peak preflight, then dictionary
+	// training, which may take minutes and so runs only for a batch that
+	// can start. A cache left cold by a stopped attempt is warmed first.
+	if w.cold {
+		if err := w.warm(); err != nil {
+			return commit.Manifest{}, err
+		}
+		w.cold = false
+	}
 	if w.o.CheckVolumes != nil {
 		if err := w.o.CheckVolumes(); err != nil {
 			return commit.Manifest{}, err
 		}
 	}
-	dict, err := w.maybeTrain()
+	dir, err := w.preflight(end - first)
 	if err != nil {
 		return commit.Manifest{}, err
 	}
-	dir, err := w.preflight(end - first)
+	dict, err := w.maybeTrain(ctx)
 	if err != nil {
 		return commit.Manifest{}, err
 	}
@@ -110,17 +145,25 @@ func (w *Writer) attempt(ctx context.Context, src logsource.LogSource, sth logso
 	if err := commit.WriteIntent(w.paths, in, w.o.Hook); err != nil {
 		return commit.Manifest{}, err
 	}
-	b := &batch{w: w, ctx: ctx, src: src, pb: w.idx.NewBatch(), state: state, before: in.MerkleBefore}
+	b := &batch{w: w, ctx: ctx, src: src, pb: w.idx.NewBatch(), state: state, before: in.MerkleBefore,
+		samples: newReservoir(canaryReservoir, first, end)}
 	defer b.pb.Close()
 	m, err := w.run(b, in, sth, dict)
 	var after errCommitted
 	if err != nil && !errors.As(err, &after) {
-		if aerr := w.abandon(in); aerr != nil {
-			return m, errors.Join(err, fmt.Errorf("abandoning %s: %w", id, aerr))
+		if aerr := w.abandon(ctx, in); aerr != nil {
+			w.broken = fmt.Errorf("%w: %s: %v", ErrAbandonFailed, id, aerr)
+			return m, errors.Join(err, w.broken)
 		}
 	}
 	return m, err
 }
+
+// ErrAbandonFailed means an attempt could not be cleaned up in process: the
+// vault could not be cut back, or its intent could not be marked. The
+// writer then refuses every further batch, and the next start recovers
+// (spec §8.5).
+var ErrAbandonFailed = errors.New("abandoning the batch failed; run update again to recover")
 
 // run is P2-P10 of one attempt.
 func (w *Writer) run(b *batch, in commit.Intent, sth logsource.SignedHead, dict commit.DictInfo) (commit.Manifest, error) {
@@ -133,6 +176,7 @@ func (w *Writer) run(b *batch, in commit.Intent, sth logsource.SignedHead, dict 
 	if err := w.vw.Sync(); err != nil {
 		return commit.Manifest{}, err
 	}
+	w.hook(HookAfterVaultSync)
 	// P4
 	verified, err := w.verify(b, sth, id.Last+1)
 	if err != nil {
@@ -188,15 +232,11 @@ func (w *Writer) run(b *batch, in commit.Intent, sth logsource.SignedHead, dict 
 	if err := b.pb.SetApplied(id.Log, seq); err != nil {
 		return m, errCommitted{err}
 	}
-	if w.o.Hook != nil {
-		w.o.Hook(HookBeforePebble)
-	}
+	w.hook(HookBeforePebble)
 	if err := b.pb.Commit(); err != nil {
 		return m, errCommitted{err}
 	}
-	if w.o.Hook != nil {
-		w.o.Hook(HookAfterPebble)
-	}
+	w.hook(HookAfterPebble)
 	// P10
 	if err := commit.RemoveIntent(w.paths, id, w.o.Hook); err != nil {
 		return m, errCommitted{err}
@@ -204,16 +244,27 @@ func (w *Writer) run(b *batch, in commit.Intent, sth logsource.SignedHead, dict 
 	if err := commit.ClearAbandoned(w.paths); err != nil {
 		return m, errCommitted{err}
 	}
+	if _, err := dataset.WriteViews(w.o.Root); err != nil { // the first commit changes it
+		return m, errCommitted{err}
+	}
 	w.logf("batch %s: %d entries, %d new certificates (%d deltas), %d leaf errors, %d vault bytes, verified by %s; commit_seq %d",
 		id, m.Counts.Entries, m.Counts.NewCerts, m.Counts.DeltaRecords, m.Counts.LeafErrors, m.Counts.VaultBytes, verified.Method, seq)
 	return m, nil
 }
 
-// Hook points around the Pebble apply (P9).
+// Hook points of the engine's own steps, for crash tests (spec §13.5).
 const (
-	HookBeforePebble = "commit.P9.before_pebble"
-	HookAfterPebble  = "commit.P9.after_pebble"
+	HookAfterVaultSync = "commit.P3.after_vault_sync"
+	HookDuringCanary   = "commit.P6.during_canary" // between the Parquet and the vault checks
+	HookBeforePebble   = "commit.P9.before_pebble"
+	HookAfterPebble    = "commit.P9.after_pebble"
 )
+
+func (w *Writer) hook(p string) {
+	if w.o.Hook != nil {
+		w.o.Hook(p)
+	}
+}
 
 // errCommitted wraps a failure after the commit point: the batch is
 // committed, so it must not be abandoned.
@@ -224,8 +275,10 @@ func (e errCommitted) Unwrap() error { return e.err }
 
 // abandon discards an attempt: vault, staging and intent go, the Pebble
 // batch is discarded by the caller, cert_ids skip to the floor, and the
-// delta cache forgets records that no longer exist.
-func (w *Writer) abandon(in commit.Intent) error {
+// delta cache forgets records that no longer exist. When ctx is done the
+// process is stopping: the cache is emptied and left cold instead of
+// re-reading the vault, and the next attempt warms it.
+func (w *Writer) abandon(ctx context.Context, in commit.Intent) error {
 	if err := w.vw.Close(); err != nil {
 		return err
 	}
@@ -236,6 +289,11 @@ func (w *Writer) abandon(in commit.Intent) error {
 	var err error
 	if w.vw, err = vault.OpenWriter(w.vaultOptions(), w.codec, in.VaultTail); err != nil {
 		return err
+	}
+	if ctx.Err() != nil {
+		w.delta.Reset()
+		w.cold = true
+		return nil
 	}
 	return w.warm()
 }
@@ -292,9 +350,7 @@ func (b *batch) assign() (uint64, error) {
 func (b *batch) vaulted(sha [32]byte, ref index.Ref) error {
 	b.counts.NewCerts++
 	b.counts.VaultBytes += uint64(ref.Loc.Len)
-	if len(b.samples) < 4096 {
-		b.samples = append(b.samples, sample{sha, ref.Loc})
-	}
+	b.samples.add(sample{sha, ref.Loc})
 	return b.pb.AddCert(sha, ref)
 }
 
@@ -402,13 +458,14 @@ func (w *Writer) canary(b *batch, stage string) error {
 	if err := w.stager.Canary(b.ctx, stage, b.rows, b.chains, w.o.CanarySamples, rnd); err != nil {
 		return errRetry{err: err}
 	}
+	w.hook(HookDuringCanary)
 	r, err := vault.OpenReader(w.o.VaultDirs, w.codec)
 	if err != nil {
 		return err
 	}
 	defer r.Close()
-	for range min(w.o.CanarySamples, len(b.samples)) {
-		s := b.samples[rnd.IntN(len(b.samples))]
+	for range min(w.o.CanarySamples, len(b.samples.items)) {
+		s := b.samples.items[rnd.IntN(len(b.samples.items))]
 		if _, err := r.ReadVerified(s.loc, s.sha); err != nil {
 			return errRetry{err: err}
 		}
@@ -420,8 +477,10 @@ func (w *Writer) canary(b *batch, stage string) error {
 // DictSamples leaf certificates; a training failure is recorded and
 // ingestion goes on with dictionary 0 (amendment A1 §5). It is tried once
 // per process. Vault corruption met while reading the samples is returned:
-// corruption is never ignored (spec §12).
-func (w *Writer) maybeTrain() (commit.DictInfo, error) {
+// corruption is never ignored (spec §12). Training takes minutes, so a
+// cancelled ctx returns at once; the abandoned training finishes in the
+// background and is discarded, and a later run trains again.
+func (w *Writer) maybeTrain(ctx context.Context) (commit.DictInfo, error) {
 	if w.dictID != 0 || w.trainTried {
 		return commit.DictInfo{ID: w.dictID}, nil
 	}
@@ -434,7 +493,23 @@ func (w *Writer) maybeTrain() (commit.DictInfo, error) {
 	}
 	w.trainTried = true
 	w.logf("training dictionary 1 on %d leaf certificates", len(samples))
-	content, err := w.o.Train(samples, 1)
+	type trained struct {
+		content []byte
+		err     error
+	}
+	done := make(chan trained, 1)
+	go func() {
+		c, err := w.o.Train(samples, 1)
+		done <- trained{c, err}
+	}()
+	var res trained
+	select {
+	case res = <-done:
+	case <-ctx.Done():
+		w.trainTried = false
+		return commit.DictInfo{}, ctx.Err()
+	}
+	content, err := res.content, res.err
 	if err == nil {
 		var d vault.Dict
 		if d, err = vault.InstallDict(w.o.VaultDirs, 1, content, tr, w.o.Now()); err == nil {

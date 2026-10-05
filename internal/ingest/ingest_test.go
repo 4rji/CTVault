@@ -250,7 +250,8 @@ func (h *harness) crashingBatch(w *Writer, sth logsource.SignedHead, first, end 
 // ends in the same verified state as a clean run.
 func TestRecoveryAfterCrashes(t *testing.T) {
 	es := entries(t, 120)
-	for _, point := range []string{"commit.P8.before_rename", HookBeforePebble, vault.HookRolloverAfterHeader} {
+	for _, point := range []string{commit.HookAfterIntent, vault.HookAppendMidRecord, vault.HookRolloverAfterHeader, HookAfterVaultSync,
+		HookDuringCanary, commit.HookBeforeRename, HookBeforePebble} {
 		t.Run(point, func(t *testing.T) {
 			h := newHarness(t, es, ctlogtest.Options{})
 			h.opts.Config.Vault.SegmentSize = 8 << 10 // batches roll over segments

@@ -15,6 +15,7 @@ import (
 	"github.com/klauspost/compress/zstd"
 
 	"github.com/4rji/ctvault/internal/loglist"
+	"github.com/4rji/ctvault/internal/logsource"
 	"github.com/4rji/ctvault/internal/merkle"
 )
 
@@ -202,23 +203,32 @@ func (s *Sample) checkpoint(st *merkle.State) error {
 	return nil
 }
 
+// StartState returns the authenticated compact range of [0, Start): empty
+// for a canonical sample, and for a representative one the left siblings of
+// the inclusion proof of leaf Start (amendment A1 §2.4).
+func (s *Sample) StartState() (*merkle.State, error) {
+	m := s.Manifest
+	if m.Kind == Canonical {
+		return merkle.NewState(), nil
+	}
+	inc := s.Proofs.Inclusion
+	if inc == nil || inc.LeafIndex != m.Start || inc.TreeSize != s.Head.TreeSize {
+		return nil, corrupt("representative sample lacks the inclusion proof of leaf %d", m.Start)
+	}
+	st, err := merkle.StateFromInclusion(m.Start, s.Head.TreeSize, inc.LeafHash, s.Head.RootHash, hashes(inc.AuditPath))
+	if err != nil {
+		return nil, corrupt("%v", err)
+	}
+	return st, nil
+}
+
 func (s *Sample) verifyMerkle() error {
 	m := s.Manifest
-	var st *merkle.State
-	switch m.Kind {
-	case Canonical:
-		st = merkle.NewState()
-	case Representative:
-		inc := s.Proofs.Inclusion
-		if inc == nil || inc.LeafIndex != m.Start || inc.TreeSize != s.Head.TreeSize {
-			return corrupt("representative sample lacks the inclusion proof of leaf %d", m.Start)
-		}
-		var err error
-		if st, err = merkle.StateFromInclusion(m.Start, s.Head.TreeSize, inc.LeafHash, s.Head.RootHash, hashes(inc.AuditPath)); err != nil {
-			return corrupt("%v", err)
-		}
+	st, err := s.StartState()
+	if err != nil {
+		return err
 	}
-	err := s.Each(func(e Entry) error {
+	err = s.Each(func(e Entry) error {
 		h := merkle.LeafHash(e.LeafInput)
 		if e.Index == m.Start && m.Kind == Representative && h != s.Proofs.Inclusion.LeafHash {
 			return corrupt("entry %d is not the leaf the inclusion proof covers", e.Index)
@@ -238,6 +248,11 @@ func (s *Sample) verifyMerkle() error {
 		return s.checkpoint(st)
 	}
 	return nil
+}
+
+// LogInfo returns the sampled log with its pinned key, served at url.
+func (s *Sample) LogInfo(url string) logsource.LogInfo {
+	return logsource.LogInfo{Name: s.Manifest.Log.Name, LogID: s.LogIDBytes(), PublicKey: s.pub, URL: url}
 }
 
 // LogIDBytes returns the sampled log's ID.

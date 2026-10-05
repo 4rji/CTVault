@@ -3,13 +3,15 @@
 A local, cryptographically verified Certificate Transparency research archive.
 Design: `docs/superpowers/specs/2026-10-04-ctvault-design.md`.
 
-**Status:** Plan 2B (vault). `ctvault update` ingests pinned logs into the
-vault:
+**Status:** Plan 2C (crash suite and measurements). `ctvault update` ingests
+pinned logs into the vault:
 - Every batch is verified against a signed tree head.
 - Every unique certificate is stored compressed and deduplicated.
 - `entries` and `chains` are written as Parquet, with `views.sql` for the
   DuckDB CLI.
-- A crash at any point recovers to the last committed batch.
+- A crash at any point recovers to the last committed batch. A test suite
+  proves it by killing the writer (SIGKILL) at every commit boundary and at
+  random moments.
 
 The derived `certs` and `names` tables arrive in Plan 3.
 
@@ -32,11 +34,30 @@ go test -race ./...
 
 | Layer | Command | Network |
 |---|---|---|
-| Unit tests, fake-log fault injection, production guard tests | `go test -race ./...` | none |
-| Dev-build behaviour | `go test -race -tags ctvault_dev ./...` | none |
-| Real-data tests (skip without a cached sample) | `go test -race -tags realdata ./internal/integration/` | none (loopback replay) |
+| Unit tests, fake-log fault injection, crash boundaries and a 25-kill loop, production guard tests | `go test -race ./...` | none |
+| Dev-build behaviour, measurements | `go test -race -tags ctvault_dev ./...` | none |
+| Real-data end to end, recovery equivalence, measurement reports (skip without a cached sample) | `go test -tags realdata -timeout 90m ./internal/integration/` | none (loopback replay) |
+| Long crash loop (200 kills) | `go test -tags nightly -run RandomKill ./internal/commit/` | none |
 | Leaf decoder fuzzing | `go test -run '^$' -fuzz FuzzDecode -fuzztime 60s ./internal/leaf/` | none |
 | Live sample capture | `ctvault-dev sample capture ...` (below) | Google, opt-in |
+
+- **The crash suite** (`internal/commit/crash_test.go`) re-runs the test
+  binary as a child, kills it with SIGKILL, then checks after every recovery:
+  - committed batches are intact, and nothing partial is visible;
+  - nothing is left beyond the vault tail or in `tmp/`;
+  - Pebble agrees with the vault;
+  - no `cert_id` of a truncated record is ever committed later;
+  - a finished ingest equals a clean one.
+
+  `-short` skips it. With `-race`, the `commit` package takes about
+  2.5 minutes.
+- **The real-data layer runs without `-race`.** Training the compression
+  dictionary on 20,000 real certificates takes about 3.5 minutes, and the
+  race detector multiplies that. The fake-log suites run the same code under
+  `-race`. The whole layer takes about 15 minutes.
+- **Temp space:** the crash suite and the real-data tests write a few hundred
+  MB under `TMPDIR`. If `/tmp` is a small tmpfs, point `TMPDIR` (and
+  `GOTMPDIR`) at a disk.
 
 ## Usage
 
@@ -65,6 +86,11 @@ export CTVAULT_ROOT=/mnt/ctvault
   `state/incidents/` and `update` exits 5.
 - **Full disk:** at the disk cap it exits 3 before a batch starts; with
   `--follow` it waits for the next cycle instead.
+- **Crashes:** the next start recovers to the last committed batch. The
+  certificate IDs a lost batch may have used are skipped, never reused, so
+  `cert_id` values can have gaps.
+- **A batch that cannot be cleaned up** (the vault cannot be cut back) stops
+  `update`, even with `--follow`. The next start recovers it.
 
 The dataset can be queried without CTVault running:
 `duckdb -c ".read /mnt/ctvault/views.sql" -c "SELECT count(*) FROM entries"`.
@@ -93,8 +119,16 @@ go build -tags ctvault_dev -o ctvault-dev ./cmd/ctvault
 ```
 
 Everything it writes lives under `~/.cache/ctvault-dev/` (home from the OS user
-database, not `$HOME`): dev vaults in `vaults/`, samples in `samples/`. It
-keeps the same 85% disk cap, applied to the normal disk.
+database, not `$HOME`):
+- dev vaults in `vaults/`;
+- samples in `samples/`;
+- measurement reports in `reports/`;
+- measurement workspaces in `tmp/`.
+
+It keeps the same 85% disk cap, applied to the disk that holds that folder.
+`~/.cache/ctvault-dev` may be a symlink to a folder on another local disk; the
+dev build resolves it. A dev vault created before such a move is refused
+afterwards, because its `VAULT_ID` records the old filesystem's UUID.
 
 ### Real-data samples
 
@@ -153,14 +187,57 @@ same client, fetcher and writer as the live log:
   67 B of index per entry. The shard's first entries are 81% final
   certificates, so they compress worse than the log's average.
 
+### Measurements
+
+```bash
+./ctvault-dev sample measure ~/.cache/ctvault-dev/samples/argon2027h1/000397220000-000397319999
+```
+
+- **What runs:** the sample, canonical or representative, goes through the
+  production per-entry pipeline: decoding, the issuance key, dedup, the vault
+  writer with dictionaries and `leaf-delta`, and Parquet staging. It commits
+  batch by batch (`--batch-size`, default 10,000), as `update` does.
+- **Where:** in a throwaway workspace under `~/.cache/ctvault-dev/tmp/`, which
+  is deleted afterwards. It never creates or changes a vault.
+- **The report** is written to
+  `~/.cache/ctvault-dev/reports/<log>/<sample>/<UTC time>.json`, with a
+  Markdown summary next to it, and the summary is also printed. It records:
+  - the provenance: CTVault, Go and dependency versions, the sample, the time;
+  - bytes per entry for the vault, Parquet and Pebble, against the
+    disk-guard seeds;
+  - compression by record kind, dictionary and entry type, and the gap
+    against the spec's C-zstd figures (flagged when more than 10% worse);
+  - precert→final links and delays, the `leaf-delta` hit rate, dedup, leaf
+    errors, and every batch.
+- **Reports change nothing.** Disk-guard seeds and defaults change only by a
+  reviewed edit.
+
+Measured on 2026-10-04, in 10,000-entry batches:
+
+| | Canonical `[0, 100000)` | Representative `[397220000, 397320000)` |
+|---|---|---|
+| Vault, B/entry (with dictionary 1) | 1079 (985) | 745 (638) |
+| Parquet, B/entry | 55 | 55 |
+| Pebble, B/entry | 72 | 71 |
+| Full leaf records with a dictionary | 1.58× | 1.71× |
+| Finals linked to a precert in the window | 2.0% (1,603 of 81,052) | 9.2% (3,943 of 42,834) |
+| `leaf-delta` saving (dictionary batches) | 37.0% | 25.8% |
+
+The spec's figures are 1.96× with a dictionary and a vault budget of 765
+B/entry. Pure-Go zstd (klauspost) at its "better" level compresses full
+records 12.7% below 1.96× on the representative window, more than amendment A1
+§5's 10% threshold, so the reports flag it and Plan 3 decides. The
+representative vault, 638 B/entry, still fits the 765 B/entry budget. Only 9%
+of final certificates there have their precert in the same window, so
+`leaf-delta` matters little; the dictionary does the work.
+
 ## Pending verification
 
 **Real-SSD smoke test: not run yet.** As of 2026-10-04 there was no access to
-the external drive. Every automated test passes, but `init` and `logs` have not
-yet been run end to end on the real drive and enclosure (USB/UAS, and LUKS if
-used). Run this before starting Plan 2 if possible, and in any case before
-trusting the vault with data. The drive must be mounted at `/mnt/ctvault`,
-ext4, and empty apart from `lost+found`:
+the external drive. Every automated test passes, but `init` and `logs` have
+not yet been run end to end on the real drive and enclosure (USB/UAS, and LUKS
+if used). Run it before trusting the vault with data. The drive must be
+mounted at `/mnt/ctvault`, ext4, and empty apart from `lost+found`:
 
 ```bash
 go build -o ctvault ./cmd/ctvault

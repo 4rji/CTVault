@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // SyncDir fsyncs a directory so that entries created, renamed or removed in it
@@ -59,6 +60,21 @@ func WriteFileAtomic(path string, data []byte, perm fs.FileMode) (err error) {
 		return err
 	}
 	return SyncDir(dir)
+}
+
+// IsAtomicTemp reports whether name is a temporary file of WriteFileAtomic,
+// ".<name>.tmp-<digits>": a writer killed before the rename leaves one.
+func IsAtomicTemp(name string) bool {
+	i := strings.LastIndex(name, ".tmp-")
+	if !strings.HasPrefix(name, ".") || i < 2 || i+len(".tmp-") == len(name) {
+		return false
+	}
+	for _, c := range name[i+len(".tmp-"):] {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // MkdirAllSync creates dir and any missing parents, fsyncing each parent whose

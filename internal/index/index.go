@@ -136,6 +136,34 @@ func (x *Index) AppliedLogs() (map[string]uint64, error) {
 	return out, it.Error()
 }
 
+// EachCert calls fn for every vaulted certificate, in SHA-256 order (for
+// checks that compare the index with the vault).
+func (x *Index) EachCert(fn func(sha [32]byte, r Ref) error) error {
+	upper := []byte(prefixCert)
+	upper[len(upper)-1]++ // "c0": just past every "c/" key, before "ch/"
+	it, err := x.db.NewIter(&pebble.IterOptions{LowerBound: []byte(prefixCert), UpperBound: upper})
+	if err != nil {
+		return err
+	}
+	defer it.Close()
+	for it.First(); it.Valid(); it.Next() {
+		k := it.Key()
+		if len(k) != len(prefixCert)+32 {
+			return errors.New("index: malformed certificate key")
+		}
+		r, err := decodeRef(it.Value())
+		if err != nil {
+			return err
+		}
+		var sha [32]byte
+		copy(sha[:], k[len(prefixCert):])
+		if err := fn(sha, r); err != nil {
+			return err
+		}
+	}
+	return it.Error()
+}
+
 // Batch holds one batch's index writes in memory until the commit point
 // (spec §6.3: "an in-memory indexed batch until commit, which also catches
 // duplicates within a batch").

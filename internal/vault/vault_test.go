@@ -386,7 +386,7 @@ func TestRolloverHooks(t *testing.T) {
 	}
 	w.AppendCert(KindLeaf, 1, []byte("der"), 0)
 	w.Close()
-	want := []string{HookRolloverBeforeHeader, HookRolloverAfterHeader, HookRolloverBeforeDirSync}
+	want := []string{HookRolloverBeforeHeader, HookRolloverAfterHeader, HookRolloverBeforeDirSync, HookAppendMidRecord}
 	if !slices.Equal(points, want) {
 		t.Fatalf("hook order %v, want %v", points, want)
 	}

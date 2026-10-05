@@ -65,10 +65,25 @@ func InspectTail(dirs []string, tail Tail) (Uncommitted, error) {
 // Truncate removes everything beyond the committed tail: the tail segment is
 // cut back to tail.Offset, later segments are deleted, and both are synced.
 // Delta records only point backwards, so no committed record loses its base.
+// A tail segment that is missing or shorter than tail.Offset is corruption:
+// truncating would extend it with zeros.
 func Truncate(dirs []string, tail Tail) error {
 	segs, err := FindSegments(dirs)
 	if err != nil {
 		return err
+	}
+	if tail.Segment > 0 {
+		p, ok := segs[tail.Segment]
+		if !ok {
+			return corrupt("tail segment %d is missing", tail.Segment)
+		}
+		fi, err := os.Stat(p)
+		if err != nil {
+			return err
+		}
+		if uint64(fi.Size()) < tail.Offset {
+			return corrupt("segment %d is %d bytes, shorter than the tail %d it would be cut to", tail.Segment, fi.Size(), tail.Offset)
+		}
 	}
 	for id, p := range segs {
 		switch {

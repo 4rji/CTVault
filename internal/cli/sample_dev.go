@@ -19,6 +19,7 @@ import (
 	"github.com/4rji/ctvault/internal/logreg"
 	"github.com/4rji/ctvault/internal/logsource"
 	"github.com/4rji/ctvault/internal/logsource/rfc6962"
+	"github.com/4rji/ctvault/internal/measure"
 	"github.com/4rji/ctvault/internal/sample"
 	"github.com/4rji/ctvault/internal/stop"
 )
@@ -30,8 +31,8 @@ func init() { extraCommands = append(extraCommands, newSampleCmd) }
 var sampleLimits = sample.DefaultLimits
 
 func newSampleCmd(a *app) *cobra.Command {
-	return groupCmd("sample", "Capture and verify real-data samples (dev build only)",
-		sampleCaptureCmd(a), sampleVerifyCmd(a))
+	return groupCmd("sample", "Capture, verify and measure real-data samples (dev build only)",
+		sampleCaptureCmd(a), sampleVerifyCmd(a), sampleMeasureCmd(a))
 }
 
 // sampleErr maps sample errors to exit codes: a failed verification is 5, a
@@ -141,6 +142,43 @@ func sampleVerifyCmd(a *app) *cobra.Command {
 			return nil
 		},
 	}
+}
+
+func sampleMeasureCmd(a *app) *cobra.Command {
+	var batch uint64
+	cmd := &cobra.Command{
+		Use:   "measure <sample dir> [--batch-size N]",
+		Short: "Run a sample through the per-entry pipeline in a throwaway workspace and write a measurement report",
+		Args:  usageArgs(cobra.ExactArgs(1)),
+		RunE: func(c *cobra.Command, args []string) error {
+			if a.d.DevBase == "" {
+				return errors.New("no dev base folder")
+			}
+			if batch == 0 || batch > 500000 {
+				return exitcode.Withf(exitcode.Usage, "--batch-size must be 1-500,000, got %d", batch)
+			}
+			s, err := sample.Open(args[0])
+			if err != nil {
+				return sampleErr(err)
+			}
+			errOut := c.ErrOrStderr()
+			stops := stop.OnSignals(c.Context(), func() {
+				fmt.Fprintln(errOut, "interrupted: stopping the measurement; no report will be written")
+			}, nil)
+			defer stops.Close()
+			r, p, err := measure.Run(stops.Soft, s, measure.Options{Base: a.d.DevBase, Version: a.d.Version, Now: a.d.Now,
+				Stat: a.d.Statfs, Out: errOut, BatchSize: batch})
+			if err != nil {
+				return ingestErr(sampleErr(err))
+			}
+			out := c.OutOrStdout()
+			fmt.Fprint(out, measure.Markdown(r))
+			fmt.Fprintf(out, "\nreport: %s\nsummary: %s\n", p.JSON, p.Markdown)
+			return nil
+		},
+	}
+	cmd.Flags().Uint64Var(&batch, "batch-size", measure.DefaultBatchSize, "entries per committed batch")
+	return cmd
 }
 
 func printSample(c *cobra.Command, s *sample.Sample, verb string) {

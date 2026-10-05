@@ -34,6 +34,9 @@ const (
 	HookRolloverBeforeHeader  = "vault.rollover.before_header"
 	HookRolloverAfterHeader   = "vault.rollover.after_header"
 	HookRolloverBeforeDirSync = "vault.rollover.before_dir_sync"
+	// HookAppendMidRecord fires with half of a record written: a kill there
+	// leaves a torn record (spec §13.5).
+	HookAppendMidRecord = "vault.append.mid_record"
 )
 
 // Writer appends records after the committed tail. It is used by one
@@ -190,14 +193,32 @@ func (w *Writer) append(r Record) (Loc, error) {
 			w.sinceChk = 0
 		}
 	}
-	// Write at the tracked offset: a reopened segment's file position is 0.
-	if _, err := w.f.WriteAt(rec, int64(w.off)); err != nil {
+	if err := w.write(rec); err != nil {
 		return Loc{}, err
 	}
 	loc := Loc{Segment: w.seg, Offset: w.off, Len: uint32(len(rec))}
 	w.off += uint64(len(rec))
 	w.unsynced = true
 	return loc, nil
+}
+
+// write puts rec at the tracked offset (a reopened segment's file position
+// is 0). With a hook set, as in crash tests, the record goes down in two
+// halves with HookAppendMidRecord between them.
+func (w *Writer) write(rec []byte) error {
+	first := rec
+	if w.o.Hook != nil {
+		first = rec[:len(rec)/2]
+	}
+	if _, err := w.f.WriteAt(first, int64(w.off)); err != nil {
+		return err
+	}
+	if len(first) == len(rec) {
+		return nil
+	}
+	w.hook(HookAppendMidRecord)
+	_, err := w.f.WriteAt(rec[len(first):], int64(w.off)+int64(len(first)))
+	return err
 }
 
 // AppendCert vaults der as a leaf (KindLeaf) or chain (KindChain) record

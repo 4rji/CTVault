@@ -41,7 +41,7 @@ func TestProductionBinaryExcludesDevCode(t *testing.T) {
 	if testing.Short() {
 		t.Skip("builds two binaries")
 	}
-	banned := []string{"/internal/volume/volumetest", "/internal/ctlogtest", "/internal/sampletest", "/internal/sample"}
+	banned := []string{"/internal/volume/volumetest", "/internal/ctlogtest", "/internal/sampletest", "/internal/sample", "/internal/vaulttest", "/internal/measure"}
 	dec := json.NewDecoder(bytes.NewReader(goCmd(t, "list", "-deps", "-json", ".")))
 	for dec.More() {
 		var p struct {

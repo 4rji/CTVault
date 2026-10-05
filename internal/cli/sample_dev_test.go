@@ -161,3 +161,34 @@ func TestSampleVerifyRefusesAPartialCopy(t *testing.T) {
 		t.Fatalf("a sample missing %s: exit %d, want %d: %s", sample.ProofsFile, code, exitcode.Verification, e.stderr)
 	}
 }
+
+// TestSampleMeasure: measure writes a report under the dev base and leaves
+// no workspace; a full disk stops it before anything is written (exit 3).
+func TestSampleMeasure(t *testing.T) {
+	e, _ := sampleEnv(t, 0.5)
+	e.mustRun("sample", "capture", "--log", "fakelog", "--entries", "48")
+	dir := filepath.Join(e.deps.DevBase, "samples", "fakelog", "000000000000-000000000047")
+	out := e.mustRun("sample", "measure", dir, "--batch-size", "16")
+	if !strings.Contains(out, "# Measurement: fakelog/000000000000-000000000047") || !strings.Contains(out, "report: ") {
+		t.Fatalf("measure output: %s", out)
+	}
+	reports, _ := filepath.Glob(filepath.Join(e.deps.DevBase, "reports", "fakelog", "000000000000-000000000047", "*.json"))
+	if len(reports) != 1 {
+		t.Fatalf("reports: %v", reports)
+	}
+	if left, _ := filepath.Glob(filepath.Join(e.deps.DevBase, "tmp", "measure-*")); len(left) != 0 {
+		t.Fatalf("workspace left behind: %v", left)
+	}
+	if code := e.run("sample", "measure", dir, "--batch-size", "0"); code != exitcode.Usage {
+		t.Fatalf("--batch-size 0: exit %d", code)
+	}
+	e.deps.Statfs = func(string) (diskguard.Usage, error) {
+		return diskguard.Usage{Total: 1 << 40, Avail: 1 << 36, Dev: 1}, nil // 94% used
+	}
+	if code := e.run("sample", "measure", dir, "--batch-size", "16"); code != exitcode.DiskCap {
+		t.Fatalf("full disk: exit %d, %s", code, e.stderr)
+	}
+	if reports, _ := filepath.Glob(filepath.Join(e.deps.DevBase, "reports", "fakelog", "000000000000-000000000047", "*.json")); len(reports) != 1 {
+		t.Fatalf("a refused run wrote a report: %v", reports)
+	}
+}

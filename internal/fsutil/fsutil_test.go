@@ -57,3 +57,21 @@ func TestMkdirAllSync(t *testing.T) {
 		t.Fatal("expected error when a file occupies the path")
 	}
 }
+
+// TestIsAtomicTemp: only the names WriteFileAtomic creates match.
+func TestIsAtomicTemp(t *testing.T) {
+	dir := t.TempDir()
+	f, err := os.CreateTemp(dir, "."+"ID_FLOOR"+".tmp-*") // the pattern WriteFileAtomic uses
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	for name, want := range map[string]bool{
+		filepath.Base(f.Name()): true, ".views.sql.tmp-12": true, ".a.json.tmp-0": true,
+		"views.sql": false, ".tmp-12": false, ".x.tmp-": false, ".x.tmp-12a": false, "x.tmp-12": false, ".hidden": false,
+	} {
+		if IsAtomicTemp(name) != want {
+			t.Errorf("IsAtomicTemp(%q) = %v", name, !want)
+		}
+	}
+}

@@ -1,6 +1,7 @@
 package merkle
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -72,12 +73,18 @@ func (s *State) Root() ([32]byte, error) {
 	return out, nil
 }
 
-// Clone returns an independent copy.
+// Clone returns an independent copy. The compact range's hash list is
+// copied: compact.Range keeps the slice it is given, and a shared list let
+// a clone's appends overwrite the original's nodes.
 func (s *State) Clone() *State {
 	if s.r == nil {
 		return &State{}
 	}
-	c, err := factory.NewRange(0, s.r.End(), s.r.Hashes())
+	hs := make([][]byte, 0, len(s.r.Hashes()))
+	for _, h := range s.r.Hashes() {
+		hs = append(hs, bytes.Clone(h))
+	}
+	c, err := factory.NewRange(0, s.r.End(), hs)
 	if err != nil {
 		panic(fmt.Sprintf("merkle: cloning a valid range failed: %v", err))
 	}

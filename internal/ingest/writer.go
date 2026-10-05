@@ -61,6 +61,9 @@ type Writer struct {
 	dictID uint64
 
 	trainTried bool
+	cold       bool  // the delta cache was emptied by a stopped attempt
+	broken     error // an abandon failed: no more batches (ErrAbandonFailed)
+	spill      string
 
 	committed []commit.Manifest
 	tips      map[string]commit.LogTip
@@ -71,6 +74,10 @@ func (w *Writer) logf(format string, args ...any) {
 		fmt.Fprintf(w.o.Out, format+"\n", args...)
 	}
 }
+
+// WriterSpillDir is the writer's DuckDB spill folder under tmp/ (spec §10.1
+// gives readers tmp/duckdb-<pid>; there is only ever one writer).
+const WriterSpillDir = "duckdb-writer"
 
 // Open recovers the vault (spec §8.5) and prepares the writer: index,
 // dictionaries, cert_id allocator, vault tail, delta cache warm-up and
@@ -112,11 +119,20 @@ func Open(o Options) (*Writer, error) {
 		}
 		w.dictID = d.Manifest.ID
 	}
-	spill := filepath.Join(o.Root, "tmp", fmt.Sprintf("duckdb-%d", os.Getpid()))
-	if w.stager, err = dataset.NewStager(dataset.Options{TempDir: spill, MaxTempBytes: w.spillLimit()}); err != nil {
+	// The writer's DuckDB spill folder has a fixed name: the writer lock
+	// makes it ours, so a killed writer's leftover is emptied here.
+	// Readers' tmp/duckdb-<pid> folders are never touched (amendment A1 §7).
+	w.spill = filepath.Join(o.Root, "tmp", WriterSpillDir)
+	if left, _ := os.ReadDir(w.spill); len(left) > 0 {
+		w.logf("recovery: emptied the writer's leftover DuckDB spill folder tmp/%s", WriterSpillDir)
+	}
+	if err := os.RemoveAll(w.spill); err != nil {
 		return nil, err
 	}
-	rec, err := commit.Recover(commit.RecoverOptions{Paths: w.paths, VaultDirs: o.VaultDirs, Index: w.idx,
+	if w.stager, err = dataset.NewStager(dataset.Options{TempDir: w.spill, MaxTempBytes: w.spillLimit()}); err != nil {
+		return nil, err
+	}
+	rec, err := commit.Recover(commit.RecoverOptions{Paths: w.paths, VaultDirs: o.VaultDirs, VaultUUID: o.VaultUUID, Index: w.idx,
 		Codec: w.codec, ChainIDs: w.stager.ChainIDs})
 	if err != nil {
 		return nil, err
@@ -188,6 +204,10 @@ func (w *Writer) warm() error {
 // Next returns the first index of log not yet committed.
 func (w *Writer) Next(log string) uint64 { return w.tips[log].Next }
 
+// Tip returns log's committed position and Merkle state (State is nil when
+// nothing of log is committed).
+func (w *Writer) Tip(log string) commit.LogTip { return w.tips[log] }
+
 // LastCommitSeq returns the highest commit_seq.
 func (w *Writer) LastCommitSeq() uint64 {
 	if len(w.committed) == 0 {
@@ -205,7 +225,7 @@ func (w *Writer) Close() error {
 		w.vw = nil
 	}
 	if w.stager != nil {
-		errs = append(errs, w.stager.Close())
+		errs = append(errs, w.stager.Close(), os.RemoveAll(w.spill))
 		w.stager = nil
 	}
 	if w.codec != nil {

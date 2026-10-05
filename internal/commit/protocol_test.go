@@ -186,8 +186,8 @@ func TestRecoverAfterCrashBeforeCommit(t *testing.T) {
 	if u, _ := vault.InspectTail(e.dirs, end1); u.Bytes != 0 {
 		t.Fatal("uncommitted vault data must be truncated")
 	}
-	if left, _ := ReadIntents(e.p); len(left) != 0 {
-		t.Fatal("the intent must be removed")
+	if left, _ := ReadIntents(e.p); len(left) != 1 || !left[0].Abandoned {
+		t.Fatalf("the intent must stay, marked abandoned, until a later commit: %+v", left)
 	}
 	if left, _ := os.ReadDir(filepath.Join(e.p.Root, "tmp", "stage")); len(left) != 0 {
 		t.Fatal("the staging directory must be removed")
@@ -197,6 +197,29 @@ func TestRecoverAfterCrashBeforeCommit(t *testing.T) {
 	m2, _, _ := e.batch(10, 5, ids2, 2, m1.MerkleAfter, r.Tail, "done")
 	if m2.CertIDRange[0] != floor {
 		t.Fatalf("the retried batch starts at the floor: %v", m2.CertIDRange)
+	}
+	if err := ClearAbandoned(e.p); err != nil {
+		t.Fatal(err)
+	}
+	if left, _ := ReadIntents(e.p); len(left) != 0 {
+		t.Fatalf("a later commit clears the abandoned intent: %+v", left)
+	}
+}
+
+// TestCrashSkipSurvivesARestartWithoutACommit: the writer that recovers may
+// stop before committing anything (update finds nothing to do, a Ctrl-C).
+// The next start must still resume at ID_FLOOR, or it would hand out again
+// the cert_ids of the records recovery truncated (spec §8.6).
+func TestCrashSkipSurvivesARestartWithoutACommit(t *testing.T) {
+	e := newEnv(t)
+	ids := e.ids(1)
+	_, s1, end1 := e.batch(0, 10, ids, 1, merkle.NewState(), vault.Tail{}, "done")
+	e.batch(10, 15, ids, 2, s1, end1, "vault") // cert_ids 11-25 written past the tail, then a kill
+	e.recover()
+	floor, _ := ReadFloor(e.p.StateDir())
+	r := e.recover() // the second start, with nothing committed in between
+	if !r.Crashed || r.NextCertID != floor {
+		t.Fatalf("the second start resumes at %d, want the floor %d (crashed=%v)", r.NextCertID, floor, r.Crashed)
 	}
 }
 
@@ -301,11 +324,13 @@ func TestAbandonInProcess(t *testing.T) {
 		t.Fatal("staging is removed")
 	}
 	floor, _ := ReadFloor(e.p.StateDir())
-	if r := e.recover(); !r.Crashed || r.NextCertID != floor {
-		t.Fatalf("a restart after an abandon resumes at the floor %d: %+v", floor, r)
-	}
-	if left, _ := ReadIntents(e.p); len(left) != 0 {
-		t.Fatal("recovery removes the abandoned intent")
+	for restart := 1; restart <= 2; restart++ {
+		if r := e.recover(); !r.Crashed || r.NextCertID != floor {
+			t.Fatalf("restart %d after an abandon resumes at the floor %d: %+v", restart, floor, r)
+		}
+		if left, _ := ReadIntents(e.p); len(left) != 1 || !left[0].Abandoned {
+			t.Fatalf("restart %d: the abandoned intent stays until a later commit: %+v", restart, left)
+		}
 	}
 }
 
@@ -349,5 +374,54 @@ func TestRecoverRefusesAnIndexAheadOfTheDataset(t *testing.T) {
 	b.Close()
 	if err := e.recoverErr(); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("an index ahead of the dataset means committed batches are missing: %v", err)
+	}
+}
+
+// TestRecoverRefusesAForeignSegment: a committed segment whose header names
+// another vault (a restore from the wrong backup) is corruption, found
+// before Pebble is rebuilt from it (spec §6.2).
+func TestRecoverRefusesAForeignSegment(t *testing.T) {
+	e := newEnv(t)
+	e.batch(0, 10, e.ids(1), 1, merkle.NewState(), vault.Tail{}, "done")
+	segs, _ := vault.FindSegments(e.dirs)
+	f, _ := os.OpenFile(segs[1], os.O_RDWR, 0)
+	b := make([]byte, vault.HeaderSize)
+	f.ReadAt(b, 0)
+	h, _ := vault.DecodeHeader(b)
+	h.VaultUUID = [16]byte{7}
+	f.WriteAt(h.Encode(), 0)
+	f.Close()
+	if err := e.recoverErr(); !errors.Is(err, vault.ErrCorrupt) {
+		t.Fatalf("a segment of another vault: %v", err)
+	}
+}
+
+// TestRecoverRemovesInterruptedAtomicWrites: a writer killed inside
+// fsutil.WriteFileAtomic leaves ".<name>.tmp-<n>" behind (found by the
+// random kill loop in state/intent). Recovery removes such leftovers from
+// the vault's metadata folders, leaves Pebble's folder and every other
+// name alone.
+func TestRecoverRemovesInterruptedAtomicWrites(t *testing.T) {
+	e := newEnv(t)
+	gone := []string{"state/intent/.fakelog__000000000080-000000000119.json.tmp-432468658", "state/.ID_FLOOR.tmp-1",
+		"state/heads/.fakelog.json.tmp-7", ".views.sql.tmp-99", "vault/dict/.1.dict.tmp-5"}
+	kept := []string{"state/notes.tmp", "state/pebble/.keep.tmp-3", "tmp/duckdb-1/.x.tmp-4", "state/.hidden"}
+	for _, p := range append(slices.Clone(gone), kept...) {
+		os.MkdirAll(filepath.Dir(filepath.Join(e.p.Root, p)), 0o755)
+		os.WriteFile(filepath.Join(e.p.Root, p), []byte("x"), 0o644)
+	}
+	r := e.recover()
+	for _, p := range gone {
+		if _, err := os.Stat(filepath.Join(e.p.Root, p)); err == nil {
+			t.Errorf("%s survived recovery", p)
+		}
+	}
+	for _, p := range kept {
+		if _, err := os.Stat(filepath.Join(e.p.Root, p)); err != nil {
+			t.Errorf("%s was removed: %v", p, err)
+		}
+	}
+	if !slices.Contains(r.Actions, "removed the leftover of an interrupted write: state/.ID_FLOOR.tmp-1") {
+		t.Errorf("actions: %q", r.Actions)
 	}
 }

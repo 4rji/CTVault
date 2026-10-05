@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -126,17 +127,12 @@ func (u *updateRun) run(c *cobra.Command) error {
 	defer stops.Close()
 	for {
 		for _, rec := range recs {
-			err := u.cycle(c, stops, w, rec, cfg, root)
-			switch {
-			case err == nil:
-			case stops.Hard.Err() != nil:
-				return exitcode.Withf(exitcode.Error, "stopped by a second interrupt; the batch in progress was abandoned")
-			case u.follow && errors.Is(err, diskguard.ErrCap):
-				fmt.Fprintf(c.ErrOrStderr(), "warning: %v; pausing until the next cycle\n", err)
-			case u.follow && errors.Is(err, fetch.ErrStalled):
-				fmt.Fprintf(c.ErrOrStderr(), "warning: %v; retrying next cycle\n", err)
-			default:
-				return ingestErr(err)
+			warning, err := afterCycle(u.cycle(c, stops, w, rec, cfg, root), u.follow, stops.Hard.Err() != nil)
+			if err != nil {
+				return err
+			}
+			if warning != "" {
+				fmt.Fprintln(c.ErrOrStderr(), warning)
 			}
 			if stops.Soft.Err() != nil {
 				fmt.Fprintln(out, "stopped after the last committed batch; run update again to continue")
@@ -153,6 +149,31 @@ func (u *updateRun) run(c *cobra.Command) error {
 		case <-time.After(cfg.Ingest.FollowInterval.Duration):
 		}
 	}
+}
+
+// afterCycle decides what update does after a cycle: a nil error goes on;
+// under --follow a full disk or a stall is a warning and waits for the next
+// cycle; anything else ends the run with its exit code (spec §11.2). A
+// writer whose abandon failed always ends the run. After a second interrupt
+// an error keeps its own exit code (an incident stays 5), and only an error
+// without one becomes "stopped" with exit 1.
+func afterCycle(err error, follow, hardStopped bool) (warning string, stop error) {
+	switch {
+	case err == nil:
+		return "", nil
+	case errors.Is(err, ingest.ErrAbandonFailed):
+		return "", ingestErr(err)
+	case hardStopped:
+		if coded := ingestErr(err); exitcode.Of(coded) != exitcode.Error {
+			return "", coded
+		}
+		return "", exitcode.Withf(exitcode.Error, "stopped by a second interrupt; the batch in progress was abandoned")
+	case follow && errors.Is(err, diskguard.ErrCap):
+		return fmt.Sprintf("warning: %v; pausing until the next cycle", err), nil
+	case follow && errors.Is(err, fetch.ErrStalled):
+		return fmt.Sprintf("warning: %v; retrying next cycle", err), nil
+	}
+	return "", ingestErr(err)
 }
 
 func (u *updateRun) logs(root string) ([]logreg.Record, error) {
@@ -211,7 +232,7 @@ func (u *updateRun) cycle(c *cobra.Command, stops *stop.Contexts, w *ingest.Writ
 		return err
 	}
 	defer closeSrc()
-	head, err := u.head(stops.Hard, src, rec.Name, last, state)
+	head, err := u.head(stops.Hard, src, rec.Name, last, w.Tip(rec.Name), state)
 	if err != nil {
 		return err
 	}
@@ -249,14 +270,19 @@ func (u *updateRun) cycle(c *cobra.Command, stops *stop.Contexts, w *ingest.Writ
 	return nil
 }
 
-// head fetches and checks the signed head; a bad signature or an incident
-// is refetched once after headRetryDelay, then written as an incident.
-func (u *updateRun) head(ctx context.Context, src logsource.LogSource, log string, last *logsource.SignedHead, state string) (logsource.SignedHead, error) {
+// head fetches and checks the signed head, against the last accepted head
+// (by src) and against the committed tip (checkTip); a bad signature or an
+// incident is refetched once after headRetryDelay, then written as an
+// incident.
+func (u *updateRun) head(ctx context.Context, src logsource.LogSource, log string, last *logsource.SignedHead, tip commit.LogTip, state string) (logsource.SignedHead, error) {
 	get := func() (h logsource.SignedHead, err error) {
 		err = fetch.Retry(ctx, fetch.Options{}, func(ctx context.Context) (err error) {
 			h, err = src.Head(ctx)
 			return err
 		})
+		if err == nil {
+			err = checkTip(ctx, src, tip, h)
+		}
 		return h, err
 	}
 	h, err := get()
@@ -278,11 +304,60 @@ func (u *updateRun) head(ctx context.Context, src logsource.LogSource, log strin
 	if last != nil {
 		ev["last_accepted_raw"] = base64.StdEncoding.EncodeToString(last.Raw)
 	}
-	b, _ := json.MarshalIndent(ev, "", " ")
-	if werr := fsutil.MkdirAllSync(dir, 0o755); werr == nil {
-		fsutil.WriteFileAtomic(filepath.Join(dir, "incident.json"), b, 0o644)
+	if tip.State != nil {
+		root, _ := tip.State.Root()
+		ev["committed_size"], ev["committed_root"] = tip.Next, hex.EncodeToString(root[:])
+	}
+	if werr := writeIncident(dir, ev); werr != nil {
+		return h2, exitcode.With(exitcode.Verification, fmt.Errorf("%s: %w (the incident could not be written to %s: %v)", log, err2, dir, werr))
 	}
 	return h2, exitcode.With(exitcode.Verification, fmt.Errorf("%s: %w (incident written to %s)", log, err2, dir))
+}
+
+func writeIncident(dir string, ev map[string]any) error {
+	b, err := json.MarshalIndent(ev, "", " ")
+	if err != nil {
+		return err
+	}
+	if err := fsutil.MkdirAllSync(dir, 0o755); err != nil {
+		return err
+	}
+	return fsutil.WriteFileAtomic(filepath.Join(dir, "incident.json"), b, 0o644)
+}
+
+// checkTip refuses a signed head that contradicts what is committed: fewer
+// entries than the committed checkpoint, or a tree that does not extend the
+// committed Merkle state (proven by a consistency proof). It runs on every
+// head, so a vault without a stored head, or with nothing left to ingest,
+// is still protected.
+func checkTip(ctx context.Context, src logsource.LogSource, tip commit.LogTip, h logsource.SignedHead) error {
+	if tip.State == nil {
+		return nil
+	}
+	root, err := tip.State.Root()
+	if err != nil {
+		return err
+	}
+	switch {
+	case h.TreeSize < tip.Next:
+		return fmt.Errorf("%w: the signed head has %d entries, fewer than the %d already committed", logsource.ErrIncident, h.TreeSize, tip.Next)
+	case h.TreeSize == tip.Next:
+		if root != h.RootHash {
+			return fmt.Errorf("%w: the signed head's root differs from the committed tree of %d entries", logsource.ErrIncident, tip.Next)
+		}
+		return nil
+	}
+	var proof [][32]byte
+	if err := fetch.Retry(ctx, fetch.Options{}, func(ctx context.Context) (err error) {
+		proof, err = src.ConsistencyProof(ctx, tip.Next, h.TreeSize)
+		return err
+	}); err != nil {
+		return err
+	}
+	if err := merkle.VerifyConsistency(tip.Next, h.TreeSize, root, h.RootHash, proof); err != nil {
+		return fmt.Errorf("%w: the signed head does not extend the committed tree of %d entries: %v", logsource.ErrIncident, tip.Next, err)
+	}
+	return nil
 }
 
 // ingestErr maps ingestion failures to spec §11.2 exit codes.

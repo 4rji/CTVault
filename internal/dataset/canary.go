@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"path/filepath"
+	"slices"
 	"time"
 )
 
@@ -28,9 +29,10 @@ var (
 )
 
 // Canary checks staged files against the rows they were written from:
-// column names and types, no bloom filter anywhere, row counts, and n random
+// column names and types, no bloom filter anywhere, row counts, n random
 // rows read back field by field through literal BLOB lookups, the path
-// readers use.
+// readers use, and cert_id range counts (spec §8.3 P6(e)): the batch's
+// whole range and n random sub-ranges.
 func (s *Stager) Canary(ctx context.Context, dir string, entries []EntryRow, chains []ChainRow, n int, rnd *rand.Rand) error {
 	ep, cp := filepath.Join(dir, EntriesFile), filepath.Join(dir, ChainsFile)
 	for _, f := range []struct {
@@ -67,6 +69,9 @@ func (s *Stager) Canary(ctx context.Context, dir string, entries []EntryRow, cha
 			return err
 		}
 	}
+	if err := s.checkCertRanges(ctx, ep, entries, n, rnd); err != nil {
+		return err
+	}
 	for range min(n, len(chains)) {
 		r := chains[rnd.IntN(len(chains))]
 		var cert uint64
@@ -74,6 +79,37 @@ func (s *Stager) Canary(ctx context.Context, dir string, entries []EntryRow, cha
 			r.ChainID[:], r.Position).Scan(&cert)
 		if err != nil || cert != r.CertID {
 			return canaryErr("chain %x position %d: cert_id %d, %v; want %d", r.ChainID[:4], r.Position, cert, err, r.CertID)
+		}
+	}
+	return nil
+}
+
+// checkCertRanges counts rows by cert_id range, as readers select them.
+func (s *Stager) checkCertRanges(ctx context.Context, path string, entries []EntryRow, n int, rnd *rand.Rand) error {
+	var ids []uint64
+	for _, e := range entries {
+		if e.CertID != 0 {
+			ids = append(ids, e.CertID)
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	slices.Sort(ids)
+	ranges := [][2]uint64{{ids[0], ids[len(ids)-1]}}
+	for range min(n, len(ids)) {
+		a, b := ids[rnd.IntN(len(ids))], ids[rnd.IntN(len(ids))]
+		ranges = append(ranges, [2]uint64{min(a, b), max(a, b)})
+	}
+	for _, r := range ranges {
+		lo, _ := slices.BinarySearch(ids, r[0]) // the first id >= r[0]
+		hi, _ := slices.BinarySearch(ids, r[1]+1)
+		var got int
+		if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM read_parquet(`+quote(path)+`) WHERE cert_id BETWEEN ? AND ?`, r[0], r[1]).Scan(&got); err != nil {
+			return err
+		}
+		if got != hi-lo {
+			return canaryErr("cert_id range [%d, %d] has %d rows, want %d", r[0], r[1], got, hi-lo)
 		}
 	}
 	return nil
