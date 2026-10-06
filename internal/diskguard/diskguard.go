@@ -134,11 +134,15 @@ func (g Guard) fits(path string, u Usage, need uint64) error {
 	return nil
 }
 
-// Seed bytes-per-entry figures used until MinHistory batches exist (spec §10.1).
+// Seed bytes-per-entry figures used until MinHistory batches exist (spec
+// §10.1). Reviewed with Plan 4's live smoke test (amendment A3 §7.4):
+// Parquet now includes certs and names (measured 172-200), Pebble measured
+// 77 over a million live entries; the vault seed covers 561-733 with a
+// dictionary.
 const (
 	SeedVaultBytesPerEntry   = 840
-	SeedParquetBytesPerEntry = 175
-	SeedPebbleBytesPerEntry  = 60
+	SeedParquetBytesPerEntry = 210
+	SeedPebbleBytesPerEntry  = 80
 	MinHistory               = 20
 
 	SegmentReserve             = 1 << 30

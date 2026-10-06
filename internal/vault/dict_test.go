@@ -3,6 +3,7 @@ package vault
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"os"
 	"strings"
@@ -31,8 +32,10 @@ func TestTrainInstallLoadAndUse(t *testing.T) {
 		t.Fatalf("LoadDicts: %d dictionaries, %v", len(ds), err)
 	}
 	m := ds[0].Manifest
-	if m.ID != 1 || m.Training != tr || m.Bytes != len(content) || !strings.HasPrefix(m.Library, "github.com/klauspost/compress") {
-		t.Fatalf("manifest %+v", m)
+	if m.ID != 1 || m.Training != tr || m.Bytes != len(content) || m.Capacity != MaxDictSize || m.Library != "libzstd 1.5.7" ||
+		m.Binding != DictBinding || m.API != "ZDICT_trainFromBuffer" || !strings.HasPrefix(m.Implementation, "ZDICT_optimizeTrainFromBuffer_fastCover") ||
+		m.Parameters == nil || *m.Parameters != TrainParameters {
+		t.Fatalf("manifest %+v (amendment A2 §2.2)", m)
 	}
 	c := codec(t)
 	if err := c.AddDict(1, ds[0].Content); err != nil {
@@ -92,18 +95,24 @@ func TestDictsAreImmutableAndReplicated(t *testing.T) {
 }
 
 // TestTrainFailureFallsBack: ingestion continues with dictionary 0 when
-// training fails (amendment A1 §5), including when the library panics.
+// training fails (amendment A1 §5): degenerate samples are an error, and a
+// dictionary that does not shrink the samples is unusable. (libzstd builds
+// its dictionary from pieces of the samples, so even random samples shrink
+// with their own dictionary; the check is shown with other data.)
 func TestTrainFailureFallsBack(t *testing.T) {
-	if _, err := Train([][]byte{[]byte("a"), []byte("b")}, 1); err == nil {
-		t.Fatal("degenerate samples (the library divides by zero on them) must give an error, not a panic")
+	for _, samples := range [][][]byte{{[]byte("a"), []byte("b")}, nil, {{}, {}}} {
+		if _, err := Train(samples, 1); err == nil {
+			t.Fatalf("degenerate samples %q must give an error, not a panic", samples)
+		}
 	}
+	_, content := trainOn(t, 120)
 	noise := make([][]byte, 60)
 	for i := range noise {
 		noise[i] = make([]byte, 1500)
 		rand.Read(noise[i])
 	}
-	if _, err := Train(noise, 1); err == nil {
-		t.Fatal("a dictionary that does not shrink its own samples is unusable")
+	if err := checkHelps(content, 1, noise); err == nil {
+		t.Fatal("a dictionary that does not shrink the samples is unusable")
 	}
 }
 
@@ -120,11 +129,36 @@ func TestTrainingSetReadsCommittedLeaves(t *testing.T) {
 	w.AppendCert(KindLeaf, 11, cs[0], 0) // beyond the committed tail
 	w.Close()
 	got, tr, err := TrainingSet(dirs, codec(t), tail, 5)
-	if err != nil || len(got) != 5 || string(got[0]) != string(cs[1]) || tr != (Training{Records: 5, FirstCertID: 2, LastCertID: 6}) {
+	h := sha256.New()
+	for _, c := range cs[1:6] {
+		h.Write(c)
+	}
+	want := Training{Records: 5, FirstCertID: 2, LastCertID: 6, Order: TrainingOrder, SamplesSHA256: hex.EncodeToString(h.Sum(nil))}
+	if err != nil || len(got) != 5 || string(got[0]) != string(cs[1]) || tr != want {
 		t.Fatalf("the first 5 leaf records (chains skipped): %d, %+v, %v", len(got), tr, err)
 	}
 	all, tr, _ := TrainingSet(dirs, codec(t), tail, 100)
 	if len(all) != 9 || tr.LastCertID != 10 {
 		t.Fatalf("never past the committed tail: %d records, %+v", len(all), tr)
+	}
+}
+
+// TestReadDictsNeverWrites: readers load dictionaries without repairing a
+// missing replica; repair is the writer's job (amendment A3 §2.3).
+func TestReadDictsNeverWrites(t *testing.T) {
+	_, content := trainOn(t, 80)
+	dirs := vaultDirs(t, 2)
+	if _, err := InstallDict(dirs, 1, content, Training{}, fixedNow()); err != nil {
+		t.Fatal(err)
+	}
+	cp, mp := dictFiles(dirs[1], 1)
+	os.Remove(mp)
+	os.Remove(cp)
+	ds, err := ReadDicts(dirs)
+	if err != nil || len(ds) != 1 || string(ds[0].Content) != string(content) {
+		t.Fatalf("ReadDicts: %d dictionaries, %v", len(ds), err)
+	}
+	if _, err := os.Stat(mp); err == nil {
+		t.Fatal("ReadDicts restored a replica: readers never write")
 	}
 }

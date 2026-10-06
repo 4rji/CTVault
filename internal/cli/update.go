@@ -85,40 +85,17 @@ func (u *updateRun) run(c *cobra.Command) error {
 			return err
 		}
 	}
-	root, id, err := a.openVault(c)
+	var recs []logreg.Record
+	ow, err := a.openWriter(c, func(root string) (err error) {
+		recs, err = u.logs(root)
+		return err
+	})
 	if err != nil {
 		return err
 	}
-	lk, err := a.writerLock(root)
-	if err != nil {
-		return err
-	}
-	defer lk.Release()
-	cfg, err := config.Load(root)
-	if err != nil {
-		return exitcode.With(exitcode.Usage, err)
-	}
-	recs, err := u.logs(root)
-	if err != nil {
-		return err
-	}
-	uuid, err := vault.ParseUUID(id.VaultUUID)
-	if err != nil {
-		return exitcode.With(exitcode.Verification, err)
-	}
-	out := c.OutOrStdout()
-	w, err := ingest.Open(ingest.Options{Root: root, VaultDirs: vaultDirs(root, id), VaultUUID: uuid, Config: cfg,
-		Guard: diskguard.Guard{Cap: cfg.Disk.MaxUsedFraction, Stat: a.d.Statfs}, Version: a.d.Version, Now: a.d.Now, Out: out,
-		CheckVolumes: func() error {
-			_, err := a.d.Volumes.Check(root)
-			return err
-		},
-		Fetch: fetch.Options{Workers: cfg.Ingest.Workers, MaxRPS: cfg.Ingest.MaxRPS, StallTimeout: cfg.Ingest.StallTimeout.Duration,
-			MaxBufferedEntries: cfg.Fetch.MaxBufferedEntries, MaxBufferedBytes: int(cfg.Fetch.MaxBufferedBytes)}})
-	if err != nil {
-		return ingestErr(err)
-	}
-	defer w.Close()
+	defer ow.close()
+	w, cfg, root, out := ow.w, ow.cfg, ow.root, c.OutOrStdout()
+	warnBuilding(c, w)
 	stops := stop.OnSignals(c.Context(), func() {
 		fmt.Fprintln(c.ErrOrStderr(), "interrupt: finishing the current batch, then stopping; press Ctrl-C again to abandon it")
 	}, func() {
@@ -370,7 +347,8 @@ func ingestErr(err error) error {
 	case errors.Is(err, volume.ErrVolume):
 		return exitcode.With(exitcode.Volume, err)
 	case errors.Is(err, ingest.ErrVerification), errors.Is(err, logsource.ErrIncident), errors.Is(err, merkle.ErrBadSignature),
-		errors.Is(err, vault.ErrCorrupt), errors.Is(err, commit.ErrCorrupt), errors.Is(err, logsource.ErrBadHeadFile):
+		errors.Is(err, vault.ErrCorrupt), errors.Is(err, commit.ErrCorrupt), errors.Is(err, logsource.ErrBadHeadFile),
+		errors.Is(err, ingest.ErrIndexInconsistent), errors.Is(err, ingest.ErrDatasetInconsistent):
 		return exitcode.With(exitcode.Verification, err)
 	}
 	return err

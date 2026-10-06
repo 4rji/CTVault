@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/4rji/ctvault/internal/config"
+	"github.com/4rji/ctvault/internal/derive"
 	"github.com/4rji/ctvault/internal/diskguard"
 	"github.com/4rji/ctvault/internal/fsutil"
 	"github.com/4rji/ctvault/internal/sample"
@@ -36,6 +38,7 @@ type Report struct {
 	Links       Links       `json:"links"`
 	Dedup       Dedup       `json:"dedup"`
 	Errors      Errors      `json:"errors"`
+	Derived     Derived     `json:"derived"`
 	Batches     []Batch     `json:"batches"`
 	Notes       []string    `json:"notes"`
 }
@@ -88,6 +91,21 @@ type Sizes struct {
 	SeedVault           int                `json:"seed_vault"`
 	SeedParquet         int                `json:"seed_parquet"`
 	SeedPebble          int                `json:"seed_pebble"`
+}
+
+// Derived measures the derived tables (amendment A2 §7): their rows and
+// bytes per entry, names per certificate, the parse_status mix, and the
+// extractor's time per certificate (every vaulted certificate parsed once
+// more after the run).
+type Derived struct {
+	CertsRows                 int            `json:"certs_rows"`
+	NamesRows                 int            `json:"names_rows"`
+	CertsBytesPerEntry        float64        `json:"certs_bytes_per_entry"`
+	NamesBytesPerEntry        float64        `json:"names_bytes_per_entry"`
+	NamesPerCert              float64        `json:"names_per_certificate"`
+	ParseStatus               map[string]int `json:"parse_status"`
+	ExtractMicrosPerCert      float64        `json:"extract_microseconds_per_certificate"`
+	ExtractedForTimingRecords int            `json:"extracted_for_timing"`
 }
 
 // Group is one kind of vault record: full leaf, leaf-delta or chain, by
@@ -237,7 +255,8 @@ func percentiles(v []int64) Delays {
 }
 
 // reportedDeps are the dependencies amendment A1 §8 names.
-var reportedDeps = []string{"github.com/duckdb/duckdb-go/v2", "github.com/cockroachdb/pebble/v2", "github.com/klauspost/compress", "github.com/transparency-dev/merkle"}
+var reportedDeps = []string{"github.com/duckdb/duckdb-go/v2", "github.com/cockroachdb/pebble/v2", "github.com/klauspost/compress", "github.com/transparency-dev/merkle",
+	"github.com/DataDog/zstd"}
 
 // provenance reads the Go build info. A go test binary's build info lists
 // no dependencies; fallback (read from go.mod by the caller) fills them in,
@@ -268,9 +287,6 @@ func provenance(version string, now time.Time, fallback map[string]string) Prove
 		if v, ok := fallback[path]; ok {
 			p.Dependencies[path], p.DependenciesFrom = v, "go.mod"
 		}
-	}
-	if v, ok := p.Dependencies["github.com/klauspost/compress"]; ok {
-		p.ZstdLibrary = "github.com/klauspost/compress " + v
 	}
 	return p
 }
@@ -395,6 +411,7 @@ func build(s *sample.Sample, o Options, sv *survey, res *result) Report {
 		}
 	}
 	r.Errors = e
+	r.Derived = derived(res, n)
 	r.Notes = notes(r, m)
 	return r
 }
@@ -436,7 +453,7 @@ func notes(r Report, m sample.Manifest) []string {
 	if r.Errors.Total != r.Errors.Committed {
 		out = append(out, fmt.Sprintf("The survey found %d leaf errors but the batches committed %d.", r.Errors.Total, r.Errors.Committed))
 	}
-	out = append(out, "The spec's compression figures are C zstd level 19. The vault uses pure-Go klauspost/compress: full records at SpeedBetterCompression, deltas at SpeedDefault.",
+	out = append(out, "The spec's compression figures are C zstd level 19. The vault writes full records with libzstd level 9 and a libzstd-trained dictionary (amendment A2 §2), deltas with klauspost/compress SpeedDefault, and reads everything with klauspost/compress.",
 		"This report changes nothing. Disk-guard seeds and the delta warm-up default change only by a reviewed edit (amendment A1 §8).")
 	return out
 }
@@ -507,6 +524,14 @@ func Markdown(r Report) string {
 	for _, g := range c.Spec {
 		f("| %s | %.3g | %.3g | %+.1f%% | %v |\n", g.What, g.Spec, g.Measured, 100*g.Gap, g.Exceeds)
 	}
+	dv := r.Derived
+	var mix []string
+	for _, k := range slices.Sorted(maps.Keys(dv.ParseStatus)) {
+		mix = append(mix, fmt.Sprintf("%s %d", k, dv.ParseStatus[k]))
+	}
+	f("\n## Derived tables\n\n")
+	f("- certs: %d rows, %.1f B/entry; names: %d rows, %.1f B/entry, %.2f names per certificate\n", dv.CertsRows, dv.CertsBytesPerEntry, dv.NamesRows, dv.NamesBytesPerEntry, dv.NamesPerCert)
+	f("- parse_status: %s; extraction %.1f µs per certificate (%d timed)\n", strings.Join(mix, ", "), dv.ExtractMicrosPerCert, dv.ExtractedForTimingRecords)
 	f("\n## Links, dedup and errors\n\n")
 	f("- precert→final: %d of %d finals link (%.1f%%), %d more have their precert later in the window; delay p50 %s, p95 %s, p99 %s\n", l.Linked, l.Finals, 100*l.LinkRate, l.PrecertLater,
 		time.Duration(l.DelayMS.P50)*time.Millisecond, time.Duration(l.DelayMS.P95)*time.Millisecond, time.Duration(l.DelayMS.P99)*time.Millisecond)
@@ -523,4 +548,26 @@ func Markdown(r Report) string {
 		f("- %s\n", n)
 	}
 	return b.String()
+}
+
+// derived sums the derived tables over the run's batches.
+func derived(res *result, entries uint64) Derived {
+	d := Derived{ParseStatus: map[string]int{}, ExtractedForTimingRecords: res.extracted}
+	var certs, names int64
+	for _, m := range res.manifests {
+		c, n := m.Files[derive.CertsV1.File()], m.Files[derive.NamesV1.File()]
+		d.CertsRows, d.NamesRows = d.CertsRows+c.Rows, d.NamesRows+n.Rows
+		certs, names = certs+c.Bytes, names+n.Bytes
+		for k, v := range m.ParseStatus {
+			d.ParseStatus[k] += v
+		}
+	}
+	d.CertsBytesPerEntry, d.NamesBytesPerEntry = perEntry(certs, entries), perEntry(names, entries)
+	if d.CertsRows > 0 {
+		d.NamesPerCert = float64(d.NamesRows) / float64(d.CertsRows)
+	}
+	if res.extracted > 0 {
+		d.ExtractMicrosPerCert = float64(res.extractNS) / float64(res.extracted) / 1e3
+	}
+	return d
 }

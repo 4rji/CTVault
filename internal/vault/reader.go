@@ -63,6 +63,10 @@ func (r *Reader) recordAt(seg, off uint64) (Record, Loc, error) {
 	return rec, loc, err
 }
 
+// RecordAt reads the record that starts at (segment, offset), such as a
+// leaf-delta's base, whose reference carries no length.
+func (r *Reader) RecordAt(seg, off uint64) (Record, Loc, error) { return r.recordAt(seg, off) }
+
 // record reads and parses the record at loc.
 func (r *Reader) record(loc Loc) (Record, error) {
 	f, err := r.file(loc.Segment)

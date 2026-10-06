@@ -91,3 +91,12 @@ func TestEstimatePeak(t *testing.T) {
 		t.Fatal("compaction reserve has a 2 GiB floor")
 	}
 }
+
+// TestSeedsAreReviewed pins the seeds: they change only by an explicit,
+// reviewed edit (A1 §8), the last one with Plan 4's live smoke test
+// (amendment A3 §7.4: measured Parquet 172-200 and Pebble 77 B/entry).
+func TestSeedsAreReviewed(t *testing.T) {
+	if SeedVaultBytesPerEntry != 840 || SeedParquetBytesPerEntry != 210 || SeedPebbleBytesPerEntry != 80 {
+		t.Fatalf("seeds vault %d, Parquet %d, Pebble %d", SeedVaultBytesPerEntry, SeedParquetBytesPerEntry, SeedPebbleBytesPerEntry)
+	}
+}

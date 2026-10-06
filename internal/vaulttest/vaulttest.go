@@ -22,6 +22,7 @@ import (
 
 	"github.com/4rji/ctvault/internal/commit"
 	"github.com/4rji/ctvault/internal/dataset"
+	"github.com/4rji/ctvault/internal/derive"
 	"github.com/4rji/ctvault/internal/fsutil"
 	"github.com/4rji/ctvault/internal/index"
 	"github.com/4rji/ctvault/internal/merkle"
@@ -65,6 +66,8 @@ type record struct {
 	loc    vault.Loc
 	certID uint64
 	sha    [32]byte
+	kind   byte
+	base   [2]uint64 // a leaf-delta's base record: segment, offset
 }
 
 // scan reads the records in [from, to), resolving each to its SHA-256. A
@@ -78,7 +81,7 @@ func (v Vault) scan(t testing.TB, from, to vault.Tail, torn bool) []record {
 		if err != nil {
 			return err
 		}
-		out = append(out, record{loc, rec.CertID, sha256.Sum256(der)})
+		out = append(out, record{loc, rec.CertID, sha256.Sum256(der), rec.Kind, [2]uint64{rec.BaseSeg, rec.BaseOff}})
 		return nil
 	})
 	if err != nil && !(torn && errors.Is(err, vault.ErrTorn)) {
@@ -293,6 +296,11 @@ func (v Vault) CheckRecovered(t testing.TB) {
 	if !slices.Equal(tmp, []string{"tmp/rebuild", "tmp/stage"}) {
 		t.Fatalf("tmp/ after recovery: %v", tmp)
 	}
+	left, _ := filepath.Glob(filepath.Join(v.Root, "state", ".exchange-probe-*"))
+	if _, err := os.Stat(filepath.Join(v.Root, "state", commit.ReindexDir)); err == nil || len(left) > 0 {
+		t.Fatalf("an interrupted repair --reindex left state/%s or %v after recovery", commit.ReindexDir, left)
+	}
+	v.CheckDerived(t)
 }
 
 func duck(t testing.TB) *sql.DB {
@@ -355,12 +363,21 @@ type Entry struct {
 	Chain         []string
 }
 
-// Dump returns every committed entry by log, in index order. A recovered
-// ingest must equal a clean one on all of it; only cert_id and chain_id may
-// differ (amendment A1 §7). Dump also checks that every reference resolves:
-// each cert_id to one vault record, each chain_id to positions 0..n-1
-// written by exactly one batch, and every committed record is referenced.
-func (v Vault) Dump(t testing.TB) map[string][]Entry {
+// Content is a vault's committed content without internal IDs: its entries
+// by log, in index order, and the derived rows of each certificate by
+// SHA-256 (hex).
+type Content struct {
+	Entries map[string][]Entry
+	Certs   map[string]string
+}
+
+// Dump returns the vault's committed content. A recovered ingest must equal
+// a clean one on all of it; only cert_id, chain_id and vault locations may
+// differ (amendment A1 §7, A2 §4). Dump also checks that every reference
+// resolves: each cert_id to one vault record, each chain_id to positions
+// 0..n-1 written by exactly one batch, and every committed record is
+// referenced.
+func (v Vault) Dump(t testing.TB) Content {
 	t.Helper()
 	ms, err := commit.ListCommitted(v.Root)
 	if err != nil {
@@ -441,11 +458,79 @@ func (v Vault) Dump(t testing.TB) map[string][]Entry {
 			t.Fatalf("committed record cert_id %d is referenced by no entry or chain", id)
 		}
 	}
+	return Content{Entries: out, Certs: v.derived(t, db, ms)}
+}
+
+// derived renders each certificate's derived rows without internal IDs: the
+// batch that built them, its certs row without cert_id, vault location and
+// delta base (whether a final is a leaf-delta depends on the delta cache;
+// CheckDerived checks it against the vault), then its names rows in order.
+func (v Vault) derived(t testing.TB, db *sql.DB, ms []commit.Manifest) map[string]string {
+	t.Helper()
+	internal := map[string]bool{"cert_id": true, "vault_seg": true, "vault_off": true, "vault_len": true, "delta_base_cert_id": true}
+	var cols, ncols []string
+	for _, c := range derive.CertsV1.Columns {
+		if !internal[c.Name] {
+			cols = append(cols, c.Name)
+		}
+	}
+	for _, c := range derive.NamesV1.Columns {
+		if !internal[c.Name] {
+			ncols = append(ncols, c.Name)
+		}
+	}
+	out := map[string]string{}
+	paths := commit.Paths{Root: v.Root}
+	for _, m := range ms {
+		if _, ok := m.Listed(derive.CertsV1.File()); !ok {
+			continue
+		}
+		dir := paths.BatchDir(m.ID())
+		names := map[uint64][]string{}
+		for _, r := range rendered(t, db, `SELECT cert_id, '', CAST(struct_pack(`+strings.Join(ncols, ", ")+`) AS VARCHAR) FROM read_parquet(`+
+			quote(filepath.Join(dir, derive.NamesV1.File()))+`, file_row_number = true) ORDER BY file_row_number`) {
+			names[r.id] = append(names[r.id], r.text)
+		}
+		for _, r := range rendered(t, db, `SELECT cert_id, sha256, CAST(struct_pack(`+strings.Join(cols, ", ")+`) AS VARCHAR) FROM read_parquet(`+
+			quote(filepath.Join(dir, derive.CertsV1.File()))+`) ORDER BY cert_id`) {
+			if _, dup := out[r.sha]; dup {
+				t.Fatalf("certificate %s has certs rows in two batches", r.sha)
+			}
+			out[r.sha] = fmt.Sprintf("batch %s %s names [%s]", m.BatchID, r.text, strings.Join(names[r.id], "; "))
+		}
+	}
+	return out
+}
+
+type renderedRow struct {
+	id        uint64
+	sha, text string
+}
+
+func rendered(t testing.TB, db *sql.DB, q string) []renderedRow {
+	t.Helper()
+	rs, err := db.Query(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rs.Close()
+	var out []renderedRow
+	for rs.Next() {
+		var r renderedRow
+		if err := rs.Scan(&r.id, &r.sha, &r.text); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, r)
+	}
+	if err := rs.Err(); err != nil {
+		t.Fatal(err)
+	}
 	return out
 }
 
 // Diff describes the first difference between two dumps, "" if equal.
-func Diff(got, want map[string][]Entry) string {
+func Diff(gotC, wantC Content) string {
+	got, want := gotC.Entries, wantC.Entries
 	for _, log := range slices.Sorted(maps.Keys(want)) {
 		g, w := got[log], want[log]
 		for i := range min(len(g), len(w)) {
@@ -460,5 +545,88 @@ func Diff(got, want map[string][]Entry) string {
 	if len(got) != len(want) {
 		return fmt.Sprintf("%d logs, want %d", len(got), len(want))
 	}
+	for _, sha := range slices.Sorted(maps.Keys(wantC.Certs)) {
+		if g, w := gotC.Certs[sha], wantC.Certs[sha]; g != w {
+			return fmt.Sprintf("certificate %s derived rows:\n got  %s\n want %s", sha, g, w)
+		}
+	}
+	if len(gotC.Certs) != len(wantC.Certs) {
+		return fmt.Sprintf("%d certificates with derived rows, want %d", len(gotC.Certs), len(wantC.Certs))
+	}
 	return ""
+}
+
+// CheckDerived asserts amendment A2 §4-5's derived files. No batch holds a
+// Parquet file its manifests do not list. In every committed batch whose
+// _COMMIT.json or _DERIVED.json lists certs, each vault record the batch
+// wrote has exactly
+// one certs row, in order: its cert_id, location and DER SHA-256, a kind
+// that matches the record (chain; precert or final for a full leaf; final
+// for a leaf-delta) and, for a leaf-delta, its base record's cert_id. Every
+// names row belongs to one of the batch's certificates.
+func (v Vault) CheckDerived(t testing.TB) {
+	t.Helper()
+	ms, err := commit.ListCommitted(v.Root)
+	if err != nil || len(ms) == 0 {
+		return
+	}
+	idAt := map[[2]uint64]uint64{}
+	for _, r := range v.scan(t, vault.Tail{}, ms[len(ms)-1].Vault.End, false) {
+		idAt[[2]uint64{r.loc.Segment, r.loc.Offset}] = r.certID
+	}
+	db := duck(t)
+	paths := commit.Paths{Root: v.Root}
+	for _, m := range ms {
+		dir := paths.BatchDir(m.ID())
+		es, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range es {
+			if _, listed := m.Listed(e.Name()); !listed && strings.HasSuffix(e.Name(), ".parquet") {
+				t.Fatalf("batch %s holds %s, which neither _COMMIT.json nor _DERIVED.json lists", m.BatchID, e.Name())
+			}
+		}
+		if _, ok := m.Listed(derive.CertsV1.File()); !ok {
+			continue
+		}
+		certs := quote(filepath.Join(dir, derive.CertsV1.File()))
+		rows, err := db.Query(`SELECT cert_id, sha256, kind, vault_seg, vault_off, vault_len, coalesce(delta_base_cert_id, 0) FROM read_parquet(` + certs + `) ORDER BY cert_id`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		recs := v.scan(t, m.Vault.Start, m.Vault.End, false)
+		i := 0
+		for ; rows.Next(); i++ {
+			var id, off, base uint64
+			var seg, length uint32
+			var sha, kind string
+			if err := rows.Scan(&id, &sha, &kind, &seg, &off, &length, &base); err != nil {
+				t.Fatal(err)
+			}
+			if i >= len(recs) {
+				t.Fatalf("batch %s: certs has more rows than the %d records it vaulted", m.BatchID, len(recs))
+			}
+			r := recs[i]
+			wantKind := map[byte][]string{vault.KindLeaf: {"precert", "final"}, vault.KindDelta: {"final"}, vault.KindChain: {"chain"}}[r.kind]
+			wantBase := uint64(0)
+			if r.kind == vault.KindDelta {
+				wantBase = idAt[r.base]
+			}
+			if id != r.certID || sha != hex.EncodeToString(r.sha[:]) || uint64(seg) != r.loc.Segment || off != r.loc.Offset ||
+				length != r.loc.Len || !slices.Contains(wantKind, kind) || base != wantBase {
+				t.Fatalf("batch %s: certs row %d (cert_id %d, %s at %d:%d+%d, base %d) differs from vault record %+v (base %d)",
+					m.BatchID, i, id, kind, seg, off, length, base, r, wantBase)
+			}
+		}
+		rows.Close()
+		if i != len(recs) {
+			t.Fatalf("batch %s: %d certs rows for %d vault records", m.BatchID, i, len(recs))
+		}
+		var orphans int
+		names := quote(filepath.Join(dir, derive.NamesV1.File()))
+		if err := db.QueryRow(`SELECT count(*) FROM read_parquet(` + names + `) WHERE cert_id NOT IN (SELECT cert_id FROM read_parquet(` + certs + `))`).Scan(&orphans); err != nil || orphans > 0 {
+			t.Fatalf("batch %s: %d names rows of no certificate in the batch (%v)", m.BatchID, orphans, err)
+		}
+	}
 }

@@ -1,0 +1,30 @@
+query: example.test
+ names  certs [issuances] · sort first_seen desc
+   ISSUANCE KEY     FIRST SEEN LAST SEEN  CERTS PRECERT FINAL ISSUERS
+▸  xxxxxxxxxxxxxxx… 2026-09-21 2026-09-21 2     yes     yes   CTVault Test CA, CTVault Test Precer…
+   xxxxxxxxxxxxxxx… 2026-09-21 2026-09-21 2     yes     yes   CTVault Test CA
+   xxxxxxxxxxxxxxx… 2026-09-21 2026-09-21 2     yes     yes   CTVault Test CA
+   xxxxxxxxxxxxxxx… 2026-09-21 2026-09-21 2     yes     yes   CTVault Test CA, CTVault Test Precer…
+   xxxxxxxxxxxxxxx… 2026-09-21 2026-09-21 2     yes     yes   CTVault Test CA
+   xxxxxxxxxxxxxxx… 2026-09-21 2026-09-21 2     yes     yes   CTVault Test CA
+   xxxxxxxxxxxxxxx… 2026-09-21 2026-09-21 2     yes     yes   CTVault Test CA, CTVault Test Precer…
+   xxxxxxxxxxxxxxx… 2026-09-21 2026-09-21 2     yes     yes   CTVault Test CA
+   xxxxxxxxxxxxxxx… 2026-09-21 2026-09-21 2     yes     yes   CTVault Test CA
+   xxxxxxxxxxxxxxx… 2026-09-21 2026-09-21 2     yes     yes   CTVault Test CA, CTVault Test Precer…
+   xxxxxxxxxxxxxxx… 2026-09-21 2026-09-21 2     yes     yes   CTVault Test CA
+   xxxxxxxxxxxxxxx… 2026-09-21 2026-09-21 2     yes     yes   CTVault Test CA
+   xxxxxxxxxxxxxxx… 2026-09-21 2026-09-21 2     yes     yes   CTVault Test CA, CTVault Test Precer…
+   xxxxxxxxxxxxxxx… 2026-09-21 2026-09-21 2     yes     yes   CTVault Test CA
+   xxxxxxxxxxxxxxx… 2026-09-21 2026-09-21 2     yes     yes   CTVault Test CA
+   xxxxxxxxxxxxxxx… 2026-09-21 2026-09-21 2     yes     yes   CTVault Test CA, CTVault Test Precer…
+   xxxxxxxxxxxxxxx… 2026-09-21 2026-09-21 2     yes     yes   CTVault Test CA
+   xxxxxxxxxxxxxxx… 2026-09-21 2026-09-21 2     yes     yes   CTVault Test CA
+   xxxxxxxxxxxxxxx… 2026-09-21 2026-09-21 2     yes     yes   CTVault Test CA, CTVault Test Precer…
+   xxxxxxxxxxxxxxx… 2026-09-21 2026-09-21 2     yes     yes   CTVault Test CA
+   xxxxxxxxxxxxxxx… 2026-09-21 2026-09-21 2     yes     yes   CTVault Test CA
+─ detail ───────────────────────────────────────────────────────────────────────────────────────────
+issuance_key xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx · first_seen 2026-09-21T14:14:18Z
+last_seen 2026-09-21T14:14:19Z · certs 2 · precert true · final true
+issuers CTVault Test CA, CTVault Test Precert Signer
+────────────────────────────────────────────────────────────────────────────────────────────────────
+30 issuances · 42 ms · certs v1 ✓ · names v1 ✓ · as-of commit 3                              [?]help

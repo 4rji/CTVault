@@ -1,0 +1,310 @@
+//go:build realdata
+
+package integration
+
+import (
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	mrand "math/rand/v2"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/4rji/ctvault/internal/commit"
+	"github.com/4rji/ctvault/internal/dataset"
+	"github.com/4rji/ctvault/internal/derive"
+	"github.com/4rji/ctvault/internal/diskguard"
+	"github.com/4rji/ctvault/internal/query"
+	"github.com/4rji/ctvault/internal/sampletest"
+)
+
+// The benchmark's settings (amendment A3 §7.1).
+const (
+	benchCopies      = 5      // copies of the 100,000-entry canonical sample per batch: 500,000 entries
+	benchCertSpan    = 200000 // cert_id offset between copies, above the sample's highest cert_id
+	benchSharedEvery = 100    // 1 in 100 registrable domains is shared by every copy, like popular domains
+	fullShardBatches = 770    // argon2027h1, about 385 million entries in batches of 500,000
+)
+
+// The two writer settings compared. DuckDB cannot choose bloom filters per
+// column (A2 §4.4).
+var benchVariants = map[string]string{
+	"a2":       "FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 122880, DICTIONARY_SIZE_LIMIT 122880",
+	"defaults": "FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 122880",
+}
+
+type benchPoint struct {
+	Variant         string  `json:"variant"`
+	Batches         int     `json:"batches"`
+	FetchFirstMS    float64 `json:"fetch_first_ms"`
+	FetchP50MS      float64 `json:"fetch_p50_ms"`
+	FetchP95MS      float64 `json:"fetch_p95_ms"`
+	AbsentP50MS     float64 `json:"absent_p50_ms"`
+	SearchCommonMS  float64 `json:"search_common_ms"`
+	SearchRareMS    float64 `json:"search_rare_ms"`
+	SearchExactMS   float64 `json:"search_exact_ms"`
+	SearchSuffixMS  float64 `json:"search_suffix_ms"`
+	CertsBytesEntry float64 `json:"certs_bytes_per_entry"`
+	NamesBytesEntry float64 `json:"names_bytes_per_entry"`
+}
+
+// TestReadPathBenchmark grows a synthetic dataset from the canonical
+// sample's real rows and measures fetch and search at 10, 50 and 100
+// batches of 500,000 entries, with A2's bloom filters and without, to
+// extrapolate to the full shard (amendment A3 §7.1). Each copy maps every
+// registrable domain to a variant of its own, except 1 in 100 shared by
+// every copy, and re-derives every SHA-256. It needs about 20 GB and
+// CTVAULT_BENCH=1; CTVAULT_BENCH_DIR (default /mnt/disk/ctvault/bench) and
+// CTVAULT_BENCH_BATCHES (default 10,50,100) adjust it.
+func TestReadPathBenchmark(t *testing.T) {
+	if os.Getenv("CTVAULT_BENCH") != "1" {
+		t.Skip("set CTVAULT_BENCH=1 to run the read-path benchmark (about 20 GB, an hour)")
+	}
+	ctx := context.Background()
+	base := os.Getenv("CTVAULT_BENCH_DIR")
+	if base == "" {
+		base = "/mnt/disk/ctvault/bench"
+	}
+	var scales []int
+	for _, s := range strings.Split(cmpOr(os.Getenv("CTVAULT_BENCH_BATCHES"), "10,50,100"), ",") {
+		n, err := strconv.Atoi(strings.TrimSpace(s))
+		if err != nil || n <= 0 {
+			t.Fatalf("CTVAULT_BENCH_BATCHES: %q", s)
+		}
+		scales = append(scales, n)
+	}
+	maxBatches := slices.Max(scales)
+
+	s := sampletest.Canonical(t, realLog)
+	src := newRealVault(t, s, 0)
+	w := src.open()
+	src.ingest(w, s.Manifest.Count, 10000)
+	w.Close()
+	srcSnap, err := query.Open(src.v.Root, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srcCerts, srcNames, srcEntries := srcSnap.Files(derive.CertsV1.File()), srcSnap.Files(derive.NamesV1.File()), srcSnap.Files(dataset.EntriesFile)
+	srcN := s.Manifest.Count
+
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.Exec(`SET temp_directory = ` + sqlQuote(filepath.Join(base, "duckdb-tmp")))
+	list := func(paths []string) string {
+		q := make([]string, len(paths))
+		for i, p := range paths {
+			q[i] = sqlQuote(p)
+		}
+		return "[" + strings.Join(q, ", ") + "]"
+	}
+	shared := fmt.Sprintf("(mod(hash(etld1), %d) = 0)", benchSharedEvery)
+	var common, rare, exact string
+	if err := db.QueryRow(`SELECT etld1 FROM read_parquet(` + list(srcNames) + `) WHERE etld1 IS NOT NULL AND ` + shared +
+		` GROUP BY 1 ORDER BY count(*) DESC, 1 LIMIT 1`).Scan(&common); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT etld1, min(name) FROM read_parquet(`+list(srcNames)+`) WHERE etld1 IS NOT NULL AND NOT `+shared+
+		` GROUP BY 1 HAVING count(*) = 1 ORDER BY 1 LIMIT 1`).Scan(&rare, &exact); err != nil {
+		t.Fatal(err)
+	}
+	// In copy 0 the rare domain and its name carry the copy's prefix.
+	orig := rare
+	rare = "c0-" + orig
+	exact = strings.TrimSuffix(exact, orig) + rare
+
+	// Generate the batches once per variant; entries are shared.
+	batchDir := func(variant string, k int) string {
+		first := uint64(k) * benchCopies * srcN
+		return filepath.Join(base, variant, "dataset", "log=bench", fmt.Sprintf("batch=%012d-%012d", first, first+benchCopies*srcN-1))
+	}
+	start := time.Now()
+	for k := 0; k < maxBatches; k++ {
+		for variant, opts := range benchVariants {
+			dir := batchDir(variant, k)
+			if _, err := os.Stat(filepath.Join(dir, derive.NamesV1.File())); err == nil {
+				continue // generated by an earlier run
+			}
+			os.MkdirAll(dir, 0o755)
+			copies := fmt.Sprintf("range(%d, %d) t(c)", k*benchCopies, (k+1)*benchCopies)
+			certCols := []string{fmt.Sprintf("(cert_id + c * %d)::UBIGINT AS cert_id", benchCertSpan), "sha256(sha256 || c::VARCHAR) AS sha256"}
+			for _, col := range derive.CertsV1.Columns[2:] {
+				if col.Name == "delta_base_cert_id" {
+					certCols = append(certCols, fmt.Sprintf("(delta_base_cert_id + c * %d)::UBIGINT AS delta_base_cert_id", benchCertSpan))
+					continue
+				}
+				certCols = append(certCols, col.Name)
+			}
+			rename := `CASE WHEN etld1 IS NULL OR ` + shared + ` THEN %s ELSE %s END`
+			newEtld1 := fmt.Sprintf(rename, "etld1", `'c' || c || '-' || etld1`)
+			newName := fmt.Sprintf(rename, "name", `left(name, length(name) - length(etld1)) || 'c' || c || '-' || etld1`)
+			stmts := []string{
+				fmt.Sprintf(`COPY (SELECT %s FROM read_parquet(%s) CROSS JOIN %s ORDER BY c, cert_id) TO %s (%s)`,
+					strings.Join(certCols, ", "), list(srcCerts), copies, sqlQuote(filepath.Join(dir, derive.CertsV1.File())), opts),
+				fmt.Sprintf(`COPY (SELECT (cert_id + c * %d)::UBIGINT AS cert_id, source, %s AS name, dns_valid, is_wildcard, tld, %s AS etld1
+					FROM read_parquet(%s, file_row_number = true) CROSS JOIN %s ORDER BY c, cert_id, file_row_number) TO %s (%s)`,
+					benchCertSpan, newName, newEtld1, list(srcNames), copies, sqlQuote(filepath.Join(dir, derive.NamesV1.File())), opts),
+			}
+			if variant == "a2" {
+				stmts = append(stmts, fmt.Sprintf(`COPY (SELECT (idx + c * %d)::UBIGINT AS idx, ct_ts + to_milliseconds(c * 1000) AS ct_ts, entry_type,
+					(cert_id + c * %d)::UBIGINT AS cert_id, leaf_hash, issuance_key, issuer_key_hash, chain_id, leaf_error
+					FROM read_parquet(%s) CROSS JOIN %s ORDER BY c, idx) TO %s (FORMAT parquet, COMPRESSION zstd, WRITE_BLOOM_FILTER false)`,
+					srcN, benchCertSpan, list(srcEntries), copies, sqlQuote(filepath.Join(dir, dataset.EntriesFile))))
+			} else {
+				os.Remove(filepath.Join(dir, dataset.EntriesFile))
+				if err := os.Symlink(filepath.Join(batchDir("a2", k), dataset.EntriesFile), filepath.Join(dir, dataset.EntriesFile)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, q := range stmts {
+				if _, err := db.Exec(q); err != nil {
+					t.Fatalf("batch %d, %s: %v", k, variant, err)
+				}
+			}
+		}
+		if (k+1)%10 == 0 {
+			t.Logf("generated %d batches in %v", k+1, time.Since(start).Round(time.Second))
+		}
+	}
+
+	snapshot := func(variant string, n int) *query.Snapshot {
+		snap := &query.Snapshot{Root: filepath.Join(base, variant), AsOf: uint64(n), Active: derive.Complete()}
+		for k := range n {
+			first := uint64(k) * benchCopies * srcN
+			lo := uint64(k*benchCopies) * benchCertSpan
+			m := commit.Manifest{Log: "bench", First: first, Last: first + benchCopies*srcN - 1, CommitSeq: uint64(k + 1),
+				CertIDRange: &[2]uint64{lo, lo + benchCopies*benchCertSpan - 1},
+				Files:       map[string]dataset.FileInfo{dataset.EntriesFile: {}, derive.CertsV1.File(): {}, derive.NamesV1.File(): {}}}
+			snap.Batches = append(snap.Batches, m)
+		}
+		return snap
+	}
+	// Present SHA-256 values: re-derived as the generation does.
+	var srcSHAs []string
+	rows, _ := db.Query(`SELECT sha256 FROM read_parquet(` + list(srcCerts) + `) USING SAMPLE 200 ROWS (reservoir, 7)`)
+	for rows.Next() {
+		var h string
+		rows.Scan(&h)
+		srcSHAs = append(srcSHAs, h)
+	}
+	rows.Close()
+	ms := func(d time.Duration) float64 { return float64(d.Microseconds()) / 1000 }
+	pct := func(d []time.Duration, q float64) float64 {
+		s := slices.Clone(d)
+		slices.Sort(s)
+		return ms(s[int(q*float64(len(s)-1))])
+	}
+	var points []benchPoint
+	for _, n := range scales {
+		for _, variant := range []string{"a2", "defaults"} {
+			snap := snapshot(variant, n)
+			sess, err := query.NewSession(base, diskguard.Guard{Cap: 0.95, Stat: diskguard.Statfs})
+			if err != nil {
+				t.Fatal(err)
+			}
+			p := benchPoint{Variant: variant, Batches: n}
+			rnd := mrand.New(mrand.NewPCG(uint64(n), 9))
+			var present, absent []time.Duration
+			for i := range 51 {
+				c := rnd.IntN(n * benchCopies)
+				sha := sha256.Sum256([]byte(srcSHAs[rnd.IntN(len(srcSHAs))] + strconv.Itoa(c)))
+				t0 := time.Now()
+				if _, err := query.Locate(ctx, snap, sess, sha); err != nil {
+					t.Fatalf("%s, %d batches: locating copy %d's %x: %v", variant, n, c, sha[:4], err)
+				}
+				if i == 0 {
+					p.FetchFirstMS = ms(time.Since(t0))
+					continue
+				}
+				present = append(present, time.Since(t0))
+			}
+			for i := range 10 {
+				sha := sha256.Sum256([]byte("absent" + strconv.Itoa(i)))
+				t0 := time.Now()
+				query.Locate(ctx, snap, sess, sha)
+				absent = append(absent, time.Since(t0))
+			}
+			p.FetchP50MS, p.FetchP95MS, p.AbsentP50MS = pct(present, 0.5), pct(present, 0.95), pct(absent, 0.5)
+			for _, c := range []struct {
+				q   query.Query
+				out *float64
+			}{
+				{query.Query{Mode: query.ModeDomain, Text: common}, &p.SearchCommonMS},
+				{query.Query{Mode: query.ModeDomain, Text: rare}, &p.SearchRareMS},
+				{query.Query{Mode: query.ModeExact, Text: exact}, &p.SearchExactMS},
+				{query.Query{Mode: query.ModeSuffix, Text: common}, &p.SearchSuffixMS},
+			} {
+				t0 := time.Now()
+				res, err := query.Search(ctx, snap, sess, nil, c.q)
+				if err != nil || len(res.Rows) == 0 {
+					t.Fatalf("%s, %d batches, %+v: %d rows, %v", variant, n, c.q, len(res.Rows), err)
+				}
+				*c.out = ms(time.Since(t0))
+			}
+			sess.Close()
+			var certs, names int64
+			for k := range n {
+				for file, sum := range map[string]*int64{derive.CertsV1.File(): &certs, derive.NamesV1.File(): &names} {
+					if st, err := os.Stat(filepath.Join(batchDir(variant, k), file)); err == nil {
+						*sum += st.Size()
+					}
+				}
+			}
+			entries := float64(uint64(n) * benchCopies * srcN)
+			p.CertsBytesEntry, p.NamesBytesEntry = float64(certs)/entries, float64(names)/entries
+			t.Logf("%+v", p)
+			points = append(points, p)
+		}
+	}
+	// Extrapolate each latency linearly in the number of batches, from the
+	// smallest and largest scales, to the full shard.
+	extrapolate := func(variant string, f func(benchPoint) float64) float64 {
+		var lo, hi benchPoint
+		for _, p := range points {
+			if p.Variant != variant {
+				continue
+			}
+			if lo.Batches == 0 || p.Batches < lo.Batches {
+				lo = p
+			}
+			if p.Batches > hi.Batches {
+				hi = p
+			}
+		}
+		slope := (f(hi) - f(lo)) / float64(hi.Batches-lo.Batches)
+		return f(hi) + slope*float64(fullShardBatches-hi.Batches)
+	}
+	report := map[string]any{"points": points, "common_domain": common, "rare_domain": rare, "exact_name": exact, "full_shard_batches": fullShardBatches}
+	full := map[string]map[string]float64{}
+	for variant := range benchVariants {
+		full[variant] = map[string]float64{
+			"fetch_p50_ms":     extrapolate(variant, func(p benchPoint) float64 { return p.FetchP50MS }),
+			"fetch_p95_ms":     extrapolate(variant, func(p benchPoint) float64 { return p.FetchP95MS }),
+			"search_common_ms": extrapolate(variant, func(p benchPoint) float64 { return p.SearchCommonMS }),
+			"search_rare_ms":   extrapolate(variant, func(p benchPoint) float64 { return p.SearchRareMS }),
+			"search_exact_ms":  extrapolate(variant, func(p benchPoint) float64 { return p.SearchExactMS }),
+		}
+	}
+	report["extrapolated_full_shard"] = full
+	b, _ := json.MarshalIndent(report, "", "  ")
+	os.WriteFile(filepath.Join(base, "report.json"), b, 0o644)
+	t.Logf("report %s:\n%s", filepath.Join(base, "report.json"), b)
+}
+
+func sqlQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }
+
+func cmpOr(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
+}

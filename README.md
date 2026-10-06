@@ -3,17 +3,28 @@
 A local, cryptographically verified Certificate Transparency research archive.
 Design: `docs/superpowers/specs/2026-10-04-ctvault-design.md`.
 
-**Status:** Plan 2C (crash suite and measurements). `ctvault update` ingests
-pinned logs into the vault:
+**Status:** Plan 5 (`explore`, the terminal UI) on top of Plan 4 (the read
+path: `search`, `fetch`, export, the post-commit audit).
+`ctvault update` ingests pinned logs into the vault:
 - Every batch is verified against a signed tree head.
-- Every unique certificate is stored compressed and deduplicated.
-- `entries` and `chains` are written as Parquet, with `views.sql` for the
-  DuckDB CLI.
+- Every unique certificate is stored once, compressed with libzstd and a
+  trained dictionary (a precert's final as a delta against it).
+- Each batch writes Parquet:
+  - `entries` and `chains`;
+  - `certs`: one row per certificate, with its parsed fields;
+  - `names`: one row per DNS name, IP address or CN, with its public suffix
+    and registrable domain.
+
+  `views.sql` exposes them to DuckDB, with `entry_certs` and `logging_delay`.
+- No certificate is ever dropped: a malformed one is kept, with stable error
+  codes (`ctvault explain-error <code>`).
 - A crash at any point recovers to the last committed batch. A test suite
   proves it by killing the writer (SIGKILL) at every commit boundary and at
   random moments.
 
-The derived `certs` and `names` tables arrive in Plan 3.
+`search`, `fetch` and `explore` read a fixed snapshot of the committed
+batches, take no lock and never write into the vault, so they run while
+`update` ingests.
 
 ## Requirements
 
@@ -36,9 +47,11 @@ go test -race ./...
 |---|---|---|
 | Unit tests, fake-log fault injection, crash boundaries and a 25-kill loop, production guard tests | `go test -race ./...` | none |
 | Dev-build behaviour, measurements | `go test -race -tags ctvault_dev ./...` | none |
-| Real-data end to end, recovery equivalence, measurement reports (skip without a cached sample) | `go test -tags realdata -timeout 90m ./internal/integration/` | none (loopback replay) |
+| Real-data end to end, recovery and rebuild equivalence, measurement reports (skip without a cached sample) | `go test -tags realdata -timeout 90m ./internal/integration/` | none (loopback replay) |
+| Extractor against `crypto/x509` on every certificate of both samples | `go test -tags realdata ./internal/extract/` | none |
 | Long crash loop (200 kills) | `go test -tags nightly -run RandomKill ./internal/commit/` | none |
 | Leaf decoder fuzzing | `go test -run '^$' -fuzz FuzzDecode -fuzztime 60s ./internal/leaf/` | none |
+| Certificate extractor fuzzing | `go test -run '^$' -fuzz FuzzParse -fuzztime 60s ./internal/extract/` | none |
 | Live sample capture | `ctvault-dev sample capture ...` (below) | Google, opt-in |
 
 - **The crash suite** (`internal/commit/crash_test.go`) re-runs the test
@@ -51,10 +64,10 @@ go test -race ./...
 
   `-short` skips it. With `-race`, the `commit` package takes about
   2.5 minutes.
-- **The real-data layer runs without `-race`.** Training the compression
-  dictionary on 20,000 real certificates takes about 3.5 minutes, and the
-  race detector multiplies that. The fake-log suites run the same code under
-  `-race`. The whole layer takes about 15 minutes.
+- **The real-data layer runs without `-race`.** It replays 100,000 real
+  entries several times; the fake-log suites run the same code under `-race`.
+  The integration layer takes about 5 minutes, the extractor's about 40
+  seconds.
 - **Temp space:** the crash suite and the real-data tests write a few hundred
   MB under `TMPDIR`. If `/tmp` is a small tmpfs, point `TMPDIR` (and
   `GOTMPDIR`) at a disk.
@@ -74,6 +87,19 @@ export CTVAULT_ROOT=/mnt/ctvault
 ./ctvault update                         # ingest up to the current signed head
 ./ctvault update --until 1000000         # stop at index 1,000,000 (exclusive)
 ./ctvault update --follow                # keep ingesting, one cycle every 10 minutes
+
+./ctvault search example.com            # names under example.com, newest first
+./ctvault search --suffix api.example.com --group certs
+./ctvault search --exact www.example.com --format json
+./ctvault search example.com --issuer R12 --since 2026-10 --format csv --output r.csv
+./ctvault search --ip 192.0.2.1
+./ctvault fetch <sha256>                 # PEM, verified against its SHA-256
+./ctvault fetch <cert_id> --format text --with-chain
+./ctvault explore example.com "issuer:Let's Encrypt" since:2026-10   # the terminal UI
+
+./ctvault stats                          # progress, ETA, disk use, projected cap date
+./ctvault stats --json
+./ctvault explain-error san_ip_bad_len    # what a parse or leaf error code means
 ```
 
 `update` (alias `ingest`):
@@ -93,7 +119,38 @@ export CTVAULT_ROOT=/mnt/ctvault
   `update`, even with `--follow`. The next start recovers it.
 
 The dataset can be queried without CTVault running:
-`duckdb -c ".read /mnt/ctvault/views.sql" -c "SELECT count(*) FROM entries"`.
+
+```bash
+duckdb -c ".read /mnt/ctvault/views.sql" -c "SELECT count(*) FROM entries"
+duckdb -c ".read /mnt/ctvault/views.sql" -c "SELECT c.issuer_cn, c.not_before FROM names n JOIN certs c USING (cert_id) WHERE n.etld1 = 'example.com'"
+duckdb -c ".read /mnt/ctvault/views.sql" -c "SELECT median(logging_delay) FROM logging_delay"
+```
+
+**Vaults written before Plan 3** gain the derived tables locally, without
+downloading anything again:
+- **Before the rebuild:** the views show them only as `certs_building` and
+  `names_building`, and `update` warns about it.
+- **The rebuild:** `ctvault rebuild` builds them from the vault and then
+  exposes `certs` and `names`. It can be interrupted, or killed, and resumed.
+
+**Search** (`ctvault search --help` lists every flag):
+- **Modes:** a registrable domain (the default), `--suffix`, `--exact`, `--ip`, and `--contains` or `--regex`, which scan every name and are slow on a large vault.
+- **Filters:** `--issuer`, `--issuer-org`, `--issued-by <CA sha256 or cert_id>` (by chain and key IDs, not by name), `--key-alg`, `--kind`, `--valid-at`, `--since`/`--until`, `--log`.
+- **Groups:** `--group names` (the default), `certs` or `issuances`.
+- **Exports:** `--output` writes `md`, `json` or `csv` with the metadata that reproduces the result: the query, the snapshot's `commit_seq` (`--as-of` re-runs it) and each log's verified head. A `csv` export puts the metadata in `<file>.meta.json`. Existing files are replaced only with `--force`.
+
+**Explore** (`ctvault explore [query] [--as-of N]`, a terminal of at least 80×24):
+- **The bar** takes search's syntax as terms: a domain, or `suffix:`, `exact:`, `ip:`, `contains:`, `regex:`, then `issuer:`, `org:`, `issued-by:`, `key:`, `kind:`, `status:`, `valid-at:`, `wildcard`, `log:`, `since:`, `until:`, `by:not-before`. Values with spaces go in double quotes.
+- **Keys:** `Tab` switches names, certs and issuances; `Enter` opens a name's certificates or a certificate's detail (names, entries, chains, the precert↔final link); `f` shows the text dump or the PEM and `w` writes it (never over a file); `Space` marks rows and `e` exports the marked rows, or all, with the selection in the metadata; `/` filters the whole result; `s` sorts; `Esc` cancels or goes back; `R` re-pins the latest commit; `?` lists the keys.
+- **The same rows as search:** explore pages through the same queries, 200 rows at a time. Without a terminal it exits 2 and points to `search`.
+
+**Post-commit audit:** after every batch, `update` looks the batch up through
+the read path. A failure is recorded in `state/health.json` and shown by
+`stats`; the batch stays committed.
+
+**Index problems:** `ctvault repair --reindex` rebuilds the Pebble index from
+the vault, beside the current one, and swaps the two atomically. A `rebuild`
+that finds the index disagreeing with the vault says so and points to it.
 
 Log names are the conventional names from the log list, lowercased:
 `argon2027h1`, `wyvern2027h1`, `oak2026h2`, `mammoth2026h2` and so on.
@@ -180,12 +237,13 @@ same client, fetcher and writer as the live log:
 - `--replay` refuses representative samples and samples of another log.
 - With `--replay`, `ingest.batch_size` and `--until` must be multiples of
   5,000, the sample's proof boundaries.
-- Measured on 2026-10-04: the 100,000-entry canonical sample replays in
-  about 4 minutes, including one-time training of the compression dictionary
-  (about 3.5 minutes).
-- The resulting vault holds about 1.1 KB of vault data, 54 B of Parquet and
-  67 B of index per entry. The shard's first entries are 81% final
-  certificates, so they compress worse than the log's average.
+- Measured on 2026-10-05: the 100,000-entry canonical sample replays in
+  about 30 seconds, including the one-time training of the compression
+  dictionary (a few seconds with libzstd).
+- The resulting vault holds about 1.0 KB of vault data, 182 B of Parquet
+  (with `certs` and `names`) and 72 B of index per entry. The shard's first
+  entries are 81% final certificates, so they compress worse than the log's
+  average.
 
 ### Measurements
 
@@ -207,29 +265,49 @@ same client, fetcher and writer as the live log:
     disk-guard seeds;
   - compression by record kind, dictionary and entry type, and the gap
     against the spec's C-zstd figures (flagged when more than 10% worse);
+  - the derived tables: rows, bytes per entry, names per certificate, the
+    `parse_status` mix and extraction time;
   - precert→final links and delays, the `leaf-delta` hit rate, dedup, leaf
     errors, and every batch.
 - **Reports change nothing.** Disk-guard seeds and defaults change only by a
   reviewed edit.
 
-Measured on 2026-10-04, in 10,000-entry batches:
+Measured on 2026-10-05 (Plan 3C), in 10,000-entry batches:
 
 | | Canonical `[0, 100000)` | Representative `[397220000, 397320000)` |
 |---|---|---|
-| Vault, B/entry (with dictionary 1) | 1079 (985) | 745 (638) |
-| Parquet, B/entry | 55 | 55 |
+| Vault, B/entry (with dictionary 1) | 1009 (894) | 686 (561) |
+| Parquet, B/entry (`certs` / `names`) | 182 (91 / 36) | 200 (99 / 46) |
 | Pebble, B/entry | 72 | 71 |
-| Full leaf records with a dictionary | 1.58× | 1.71× |
+| Full leaf records with a dictionary | 1.74× | 1.96× |
 | Finals linked to a precert in the window | 2.0% (1,603 of 81,052) | 9.2% (3,943 of 42,834) |
-| `leaf-delta` saving (dictionary batches) | 37.0% | 25.8% |
+| `leaf-delta` saving (dictionary batches) | 30.3% | 17.8% |
+| Names per certificate | 1.86 | 1.93 |
 
-The spec's figures are 1.96× with a dictionary and a vault budget of 765
-B/entry. Pure-Go zstd (klauspost) at its "better" level compresses full
-records 12.7% below 1.96× on the representative window, more than amendment A1
-§5's 10% threshold, so the reports flag it and Plan 3 decides. The
-representative vault, 638 B/entry, still fits the 765 B/entry budget. Only 9%
-of final certificates there have their precert in the same window, so
-`leaf-delta` matters little; the dictionary does the work.
+**Compression:** full records are libzstd level 9 with a dictionary trained
+by libzstd (amendment A2 §2).
+- On the representative window this reaches the spec's 1.96×.
+- The representative vault, 561 B/entry, is well inside the spec's 765
+  B/entry budget.
+- Only 9% of final certificates there have their precert in the same window,
+  so `leaf-delta` matters little; the dictionary does the work.
+
+**Live smoke test (2026-10-05):** two real batches of 500,000 entries were ingested from `argon2027h1` into a dev vault.
+
+| | Batch 1, 5 requests/s | Batch 2, 20 requests/s |
+|---|---|---|
+| Time | 53 min | 14.4 min |
+| HTTP 429 responses | 15 of 15,640 (0.1%) | 5 of 15,630 (0.03%) |
+| Vault, B/entry | 1,295 (no dictionary yet) | 733 (dictionary 1) |
+| Parquet, B/entry | 177 | 172 |
+| Peak memory | 1.85 GB | 2.0 GB |
+
+- Pebble held 77 B/entry after 1,000,000 entries.
+- On that vault, `fetch` takes 46 ms and `search amazonaws.com` 0.5 s, process start included.
+- The defaults (`max_rps = 20`, 4 workers) are sustainable from one IP.
+
+**Disk-guard seeds** (applied after review): vault 840, Parquet 210 (it now
+includes `certs` and `names`), Pebble 80 B/entry.
 
 ## Pending verification
 

@@ -1,0 +1,30 @@
+query: example.test
+ names [certs] issuances  · sort first_seen desc
+   SHA256       CERT ID   KIND    ISSUER CN       NOT BEFORE NOT AFTER  NAMES FIRST SEEN LAST SEEN
+▸  xxxxxxxxxxx… 62        final   CTVault Test CA 2026-10-01 2026-12-30 2     2026-09-21 2026-09-21
+   xxxxxxxxxxx… 61        precert CTVault Test P… 2026-10-01 2026-12-30 2     2026-09-21 2026-09-21
+   xxxxxxxxxxx… 60        final   CTVault Test CA 2026-10-01 2026-12-30 2     2026-09-21 2026-09-21
+   xxxxxxxxxxx… 59        precert CTVault Test CA 2026-10-01 2026-12-30 2     2026-09-21 2026-09-21
+   xxxxxxxxxxx… 58        final   CTVault Test CA 2026-10-01 2026-12-30 2     2026-09-21 2026-09-21
+   xxxxxxxxxxx… 57        precert CTVault Test CA 2026-10-01 2026-12-30 2     2026-09-21 2026-09-21
+   xxxxxxxxxxx… 56        final   CTVault Test CA 2026-10-01 2026-12-30 2     2026-09-21 2026-09-21
+   xxxxxxxxxxx… 55        precert CTVault Test P… 2026-10-01 2026-12-30 2     2026-09-21 2026-09-21
+   xxxxxxxxxxx… 54        final   CTVault Test CA 2026-10-01 2026-12-30 2     2026-09-21 2026-09-21
+   xxxxxxxxxxx… 53        precert CTVault Test CA 2026-10-01 2026-12-30 2     2026-09-21 2026-09-21
+   xxxxxxxxxxx… 52        final   CTVault Test CA 2026-10-01 2026-12-30 2     2026-09-21 2026-09-21
+   xxxxxxxxxxx… 51        precert CTVault Test CA 2026-10-01 2026-12-30 2     2026-09-21 2026-09-21
+   xxxxxxxxxxx… 50        final   CTVault Test CA 2026-10-01 2026-12-30 2     2026-09-21 2026-09-21
+   xxxxxxxxxxx… 49        precert CTVault Test P… 2026-10-01 2026-12-30 2     2026-09-21 2026-09-21
+   xxxxxxxxxxx… 48        final   CTVault Test CA 2026-10-01 2026-12-30 2     2026-09-21 2026-09-21
+   xxxxxxxxxxx… 47        precert CTVault Test CA 2026-10-01 2026-12-30 2     2026-09-21 2026-09-21
+   xxxxxxxxxxx… 46        final   CTVault Test CA 2026-10-01 2026-12-30 2     2026-09-21 2026-09-21
+   xxxxxxxxxxx… 45        precert CTVault Test CA 2026-10-01 2026-12-30 2     2026-09-21 2026-09-21
+   xxxxxxxxxxx… 44        final   CTVault Test CA 2026-10-01 2026-12-30 2     2026-09-21 2026-09-21
+   xxxxxxxxxxx… 43        precert CTVault Test P… 2026-10-01 2026-12-30 2     2026-09-21 2026-09-21
+   xxxxxxxxxxx… 42        final   CTVault Test CA 2026-10-01 2026-12-30 2     2026-09-21 2026-09-21
+─ detail ───────────────────────────────────────────────────────────────────────────────────────────
+sha256 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx · cert_id 62 · kind final
+issuer_cn CTVault Test CA · not_before 2026-10-01T00:00:00Z · not_after 2026-12-30T00:00:00Z
+names 2 · first_seen 2026-09-21T14:14:19Z · last_seen 2026-09-21T14:14:19Z · logs fakelog
+────────────────────────────────────────────────────────────────────────────────────────────────────
+60 certs · 42 ms · certs v1 ✓ · names v1 ✓ · as-of commit 3                                  [?]help

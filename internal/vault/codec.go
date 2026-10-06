@@ -13,17 +13,18 @@ const maxCert = 1 << 24
 // Codec compresses and decompresses record frames. Frames carry a content
 // checksum. A frame's own dictionary ID must equal the record's dict_id, so
 // a record can never be decoded with the wrong dictionary. Leaf and chain
-// frames use the better level; delta frames use the default level, which is
-// as small for deltas and 3.5x faster (measured 2026-10-04). Delta frames
-// use their base certificate as a raw dictionary with ID 0, so the frame's
-// dictionary ID is omitted (spec §6.2). A Codec is not safe for concurrent
-// use.
+// frames are libzstd level 9 (amendment A2 §2.1); delta frames are
+// klauspost's default level, as small for deltas and 3.5x faster than its
+// better level (measured 2026-10-04). Delta frames use their base
+// certificate as a raw dictionary with ID 0, so the frame's dictionary ID
+// is omitted (spec §6.2). Every frame is read with klauspost's decoders,
+// whichever encoder wrote it. A Codec is not safe for concurrent use.
 type Codec struct {
-	enc      map[uint64]*zstd.Encoder // dict_id → encoder
-	dicts    map[uint64][]byte        // trained dictionaries by ID
-	dec      *zstd.Decoder            // leaf and chain frames
-	deltaEnc *zstd.Encoder            // reset with each base
-	deltaDec *zstd.Decoder            // reset with each base
+	enc      map[uint64]*cEncoder // dict_id → encoder
+	dicts    map[uint64][]byte    // trained dictionaries by ID
+	dec      *zstd.Decoder        // leaf and chain frames
+	deltaEnc *zstd.Encoder        // reset with each base
+	deltaDec *zstd.Decoder        // reset with each base
 }
 
 func newDecoder(dicts map[uint64][]byte) (*zstd.Decoder, error) {
@@ -40,8 +41,7 @@ func newDecoder(dicts map[uint64][]byte) (*zstd.Decoder, error) {
 
 // NewCodec returns a codec that knows dict_id 0 (no dictionary).
 func NewCodec() (*Codec, error) {
-	enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedBetterCompression), zstd.WithEncoderCRC(true),
-		zstd.WithEncoderConcurrency(1))
+	enc, err := newCEncoder(nil)
 	if err != nil {
 		return nil, err
 	}
@@ -58,7 +58,7 @@ func NewCodec() (*Codec, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Codec{enc: map[uint64]*zstd.Encoder{0: enc}, dicts: map[uint64][]byte{}, dec: dec,
+	return &Codec{enc: map[uint64]*cEncoder{0: enc}, dicts: map[uint64][]byte{}, dec: dec,
 		deltaEnc: deltaEnc, deltaDec: deltaDec}, nil
 }
 
@@ -68,8 +68,7 @@ func (c *Codec) AddDict(id uint64, content []byte) error {
 	if id == 0 {
 		return fmt.Errorf("vault: dictionary ID 0 means no dictionary")
 	}
-	enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedBetterCompression), zstd.WithEncoderCRC(true),
-		zstd.WithEncoderConcurrency(1), zstd.WithEncoderDict(content))
+	enc, err := newCEncoder(content)
 	if err != nil {
 		return fmt.Errorf("vault: dictionary %d: %w", id, err)
 	}
@@ -79,10 +78,13 @@ func (c *Codec) AddDict(id uint64, content []byte) error {
 	}
 	dec, err := newDecoder(dicts)
 	if err != nil {
-		enc.Close()
+		enc.close()
 		return fmt.Errorf("vault: dictionary %d: %w", id, err)
 	}
 	c.dec.Close()
+	if old, ok := c.enc[id]; ok {
+		old.close()
+	}
 	c.dec, c.dicts, c.enc[id] = dec, dicts, enc
 	return nil
 }
@@ -120,7 +122,7 @@ func (c *Codec) Compress(der []byte, dictID uint64) ([]byte, error) {
 	if !ok {
 		return nil, fmt.Errorf("vault: no dictionary %d", dictID)
 	}
-	return e.EncodeAll(der, nil), nil
+	return e.encode(der)
 }
 
 // Decompress decodes a leaf or chain frame written with dictID.
@@ -142,7 +144,7 @@ func (c *Codec) Decompress(frame []byte, dictID uint64) ([]byte, error) {
 // Close releases the codec's encoders and decoders.
 func (c *Codec) Close() {
 	for _, e := range c.enc {
-		e.Close()
+		e.close()
 	}
 	c.dec.Close()
 	c.deltaEnc.Close()

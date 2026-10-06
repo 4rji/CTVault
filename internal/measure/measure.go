@@ -28,6 +28,7 @@ import (
 	"github.com/4rji/ctvault/internal/commit"
 	"github.com/4rji/ctvault/internal/config"
 	"github.com/4rji/ctvault/internal/diskguard"
+	"github.com/4rji/ctvault/internal/extract"
 	"github.com/4rji/ctvault/internal/fetch"
 	"github.com/4rji/ctvault/internal/ingest"
 	"github.com/4rji/ctvault/internal/leaf"
@@ -234,6 +235,8 @@ type result struct {
 	groups    map[groupKey]*Group
 	deltas    map[uint64]*DeltaSaving // by the dictionary of the delta's batch
 	chainRecs int
+	extractNS int64 // time spent re-parsing every vaulted certificate
+	extracted int
 }
 
 type groupKey struct {
@@ -328,6 +331,10 @@ func scanVault(dirs []string, sv *survey, res *result) error {
 			if err != nil {
 				return err
 			}
+			t0 := time.Now()
+			extract.Parse(der)
+			res.extractNS += time.Since(t0).Nanoseconds()
+			res.extracted++
 			sha := sha256.Sum256(der)
 			k := groupKey{dict: rec.DictID}
 			switch rec.Kind {

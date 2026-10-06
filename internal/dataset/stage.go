@@ -62,7 +62,7 @@ type FileInfo struct {
 type Options struct {
 	TempDir      string // <root>/tmp/duckdb-<pid> (spec §10.1)
 	MaxTempBytes uint64 // max_temp_directory_size: headroom below the cap minus 1 GiB
-	Threads      int    // 0 = DuckDB's default
+	Threads      int    // 0 = 1: one thread makes staged files byte-identical for the same rows (spec §7.2)
 }
 
 // Stager owns one in-memory DuckDB session. Not safe for concurrent use.
@@ -81,9 +81,8 @@ func NewStager(o Options) (*Stager, error) {
 		fmt.Sprintf("SET temp_directory = %s", quote(o.TempDir)),
 		fmt.Sprintf("SET max_temp_directory_size = '%dB'", o.MaxTempBytes),
 	}
-	if o.Threads > 0 {
-		settings = append(settings, fmt.Sprintf("SET threads = %d", o.Threads))
-	}
+	settings = append(settings, fmt.Sprintf("SET threads = %d", max(o.Threads, 1)),
+		"SET preserve_insertion_order = true") // derived files keep the order rows were added in
 	c, err := duckdb.NewConnector("", func(execer driver.ExecerContext) error {
 		for _, q := range settings {
 			if _, err := execer.ExecContext(context.Background(), q, nil); err != nil {
@@ -97,6 +96,10 @@ func NewStager(o Options) (*Stager, error) {
 	}
 	return &Stager{connector: c, db: sql.OpenDB(c)}, nil
 }
+
+// DB is the session's database, for the writer's post-commit audit, which
+// reads through the query package (amendment A3 §6).
+func (s *Stager) DB() *sql.DB { return s.db }
 
 // Close closes the session.
 func (s *Stager) Close() error {
@@ -239,6 +242,46 @@ func syncAndSum(p string) (FileInfo, error) {
 
 // Sum returns a committed file's size and SHA-256, for recovery and verify.
 func Sum(p string) (FileInfo, error) { return syncAndSum(p) }
+
+// EntryTypes reads, from a committed entries.parquet, the distinct entry
+// types of the entries that reference each cert_id, sorted (a rebuild
+// cross-checks certificate kinds with them, amendment A2 §5.2).
+func (s *Stager) EntryTypes(path string) (map[uint64][]string, error) {
+	rows, err := s.db.Query(`SELECT DISTINCT cert_id, entry_type FROM read_parquet(` + quote(path) + `) WHERE cert_id IS NOT NULL ORDER BY 1, 2`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[uint64][]string{}
+	for rows.Next() {
+		var id uint64
+		var typ string
+		if err := rows.Scan(&id, &typ); err != nil {
+			return nil, err
+		}
+		out[id] = append(out[id], typ)
+	}
+	return out, rows.Err()
+}
+
+// ChainCertIDs reads the distinct cert_id values of a committed
+// chains.parquet.
+func (s *Stager) ChainCertIDs(path string) (map[uint64]bool, error) {
+	rows, err := s.db.Query(`SELECT DISTINCT cert_id FROM read_parquet(` + quote(path) + `)`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[uint64]bool{}
+	for rows.Next() {
+		var id uint64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out[id] = true
+	}
+	return out, rows.Err()
+}
 
 // ChainIDs reads the distinct chain_id values of a committed chains.parquet
 // (recovery re-applies them to the index).

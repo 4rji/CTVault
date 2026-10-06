@@ -1,7 +1,8 @@
 package vault
 
 // DeltaCache maps a precert's full 32-byte issuance digest to its vault
-// record, for recently vaulted precerts (spec §6.2, amendment A1 §5). It is
+// record and cert_id (the final certificate's certs.delta_base_cert_id),
+// for recently vaulted precerts (spec §6.2, amendment A1 §5). It is
 // an optimization only: an eviction or a restart simply stores the final
 // certificate in full. Entries are evicted oldest first, which for
 // precerts inserted once and looked up once behaves like an LRU.
@@ -21,6 +22,7 @@ type DeltaCache struct {
 type cacheSlot struct {
 	digest [32]byte
 	loc    Loc
+	certID uint64
 	used   bool
 }
 
@@ -35,14 +37,15 @@ func prefix(d [32]byte) (p [16]byte) {
 	return p
 }
 
-// Put records a precert's location, evicting the oldest entry when full.
-func (c *DeltaCache) Put(digest [32]byte, loc Loc) {
+// Put records a precert's location and cert_id, evicting the oldest entry
+// when full.
+func (c *DeltaCache) Put(digest [32]byte, loc Loc, certID uint64) {
 	if len(c.ring) == 0 {
 		return
 	}
 	k := prefix(digest)
 	if i, ok := c.idx[k]; ok && c.ring[i].digest == digest {
-		c.ring[i].loc = loc
+		c.ring[i].loc, c.ring[i].certID = loc, certID
 		return
 	}
 	slot := &c.ring[c.next]
@@ -51,18 +54,18 @@ func (c *DeltaCache) Put(digest [32]byte, loc Loc) {
 			delete(c.idx, old)
 		}
 	}
-	*slot = cacheSlot{digest: digest, loc: loc, used: true}
+	*slot = cacheSlot{digest: digest, loc: loc, certID: certID, used: true}
 	c.idx[k] = int32(c.next)
 	c.next = (c.next + 1) % len(c.ring)
 }
 
-// Get returns the precert record for digest.
-func (c *DeltaCache) Get(digest [32]byte) (Loc, bool) {
+// Get returns the precert record and cert_id for digest.
+func (c *DeltaCache) Get(digest [32]byte) (Loc, uint64, bool) {
 	i, ok := c.idx[prefix(digest)]
 	if !ok || c.ring[i].digest != digest {
-		return Loc{}, false
+		return Loc{}, 0, false
 	}
-	return c.ring[i].loc, true
+	return c.ring[i].loc, c.ring[i].certID, true
 }
 
 // Len returns the number of cached precerts.
@@ -104,7 +107,7 @@ func Warm(dirs []string, codec *Codec, c *DeltaCache, ranges []Range, digest fun
 				return err
 			}
 			if d, ok := digest(der); ok {
-				c.Put(d, loc)
+				c.Put(d, loc, rec.CertID)
 			}
 			return nil
 		})

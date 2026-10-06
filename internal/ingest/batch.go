@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
@@ -17,7 +18,9 @@ import (
 
 	"github.com/4rji/ctvault/internal/commit"
 	"github.com/4rji/ctvault/internal/dataset"
+	"github.com/4rji/ctvault/internal/derive"
 	"github.com/4rji/ctvault/internal/diskguard"
+	"github.com/4rji/ctvault/internal/extract"
 	"github.com/4rji/ctvault/internal/fetch"
 	"github.com/4rji/ctvault/internal/fsutil"
 	"github.com/4rji/ctvault/internal/index"
@@ -72,7 +75,14 @@ type batch struct {
 	counts  commit.Counts
 	firstID uint64
 	lastID  uint64
-	samples *reservoir // vault records the canary reads back
+	samples *reservoir            // vault records the canary reads back
+	builds  []derive.Builder      // the builders ACTIVE.json enables (amendment A2 §4.6)
+	dstage  *dataset.DerivedStage // their rows, staged as they are built (amendment A2 §4.3)
+
+	fetch      fetch.Stats    // the attempt's fetcher statistics
+	parse      map[string]int // parse_status of the new certificates
+	deltaSamp  int            // sampled leaf-delta records (amendment A2 §6.1)
+	deltaSaved int64          // bytes they saved against full records
 }
 
 type sample struct {
@@ -147,6 +157,7 @@ func (w *Writer) attempt(ctx context.Context, src logsource.LogSource, sth logso
 	}
 	b := &batch{w: w, ctx: ctx, src: src, pb: w.idx.NewBatch(), state: state, before: in.MerkleBefore,
 		samples: newReservoir(canaryReservoir, first, end)}
+	b.builds = w.builders()
 	defer b.pb.Close()
 	m, err := w.run(b, in, sth, dict)
 	var after errCommitted
@@ -169,7 +180,21 @@ var ErrAbandonFailed = errors.New("abandoning the batch failed; run update again
 func (w *Writer) run(b *batch, in commit.Intent, sth logsource.SignedHead, dict commit.DictInfo) (commit.Manifest, error) {
 	id := in.ID()
 	// P2
-	if _, err := fetch.Run(b.ctx, b.src, id.First, id.Last+1, w.o.Fetch, b.add); err != nil {
+	if len(b.builds) > 0 {
+		var tables []derive.Table
+		for _, bl := range b.builds {
+			tables = append(tables, bl.Table())
+		}
+		d, err := w.stager.BeginDerived(b.ctx, tables, w.o.CanarySamples, rand.New(rand.NewPCG(id.First, id.Last)))
+		if err != nil {
+			return commit.Manifest{}, err
+		}
+		defer d.Close()
+		b.dstage = d
+	}
+	stats, err := fetch.Run(b.ctx, b.src, id.First, id.Last+1, w.o.Fetch, b.add)
+	b.fetch = stats
+	if err != nil {
 		return commit.Manifest{}, err
 	}
 	// P3
@@ -187,6 +212,13 @@ func (w *Writer) run(b *batch, in commit.Intent, sth logsource.SignedHead, dict 
 	files, err := w.stager.Stage(b.ctx, stage, b.rows, b.chains)
 	if err != nil {
 		return commit.Manifest{}, err
+	}
+	if b.dstage != nil {
+		dfiles, err := b.dstage.Write(b.ctx, stage)
+		if err != nil {
+			return commit.Manifest{}, err
+		}
+		maps.Copy(files, dfiles)
 	}
 	if b.quar.Len() > 0 {
 		p := filepath.Join(stage, commit.QuarantineFile)
@@ -211,8 +243,9 @@ func (w *Writer) run(b *batch, in commit.Intent, sth logsource.SignedHead, dict 
 	seq := w.LastCommitSeq() + 1
 	m := commit.Manifest{Format: commit.ManifestFormat, CommitSeq: seq, BatchID: id.String(), Log: id.Log,
 		First: id.First, Last: id.Last, STH: toSTH(sth), MerkleAfter: b.state, Verified: verified,
-		NextCertID: w.ids.Peek(), Vault: commit.Span{Start: in.VaultTail, End: w.vw.Tail()}, Builders: map[string]int{},
-		Files: files, Counts: b.counts, Dictionary: dict, CTVaultVersion: w.o.Version, CommittedAt: w.o.Now().UTC()}
+		NextCertID: w.ids.Peek(), Vault: commit.Span{Start: in.VaultTail, End: w.vw.Tail()}, Builders: b.tables(),
+		Files: files, Counts: b.counts, Dictionary: dict, CTVaultVersion: w.o.Version, CommittedAt: w.o.Now().UTC(),
+		Fetch: b.fetchCounts(), ParseStatus: b.parse, DeltaSaved: b.deltaSavedEstimate()}
 	m.Counts.Entries = len(b.rows)
 	if b.firstID != 0 {
 		m.CertIDRange = &[2]uint64{b.firstID, b.lastID}
@@ -244,11 +277,13 @@ func (w *Writer) run(b *batch, in commit.Intent, sth logsource.SignedHead, dict 
 	if err := commit.ClearAbandoned(w.paths); err != nil {
 		return m, errCommitted{err}
 	}
-	if _, err := dataset.WriteViews(w.o.Root); err != nil { // the first commit changes it
+	if _, err := dataset.WriteViews(w.o.Root, w.active); err != nil { // the first commit changes it
 		return m, errCommitted{err}
 	}
 	w.logf("batch %s: %d entries, %d new certificates (%d deltas), %d leaf errors, %d vault bytes, verified by %s; commit_seq %d",
 		id, m.Counts.Entries, m.Counts.NewCerts, m.Counts.DeltaRecords, m.Counts.LeafErrors, m.Counts.VaultBytes, verified.Method, seq)
+	// P11
+	w.audit(b.ctx, m)
 	return m, nil
 }
 
@@ -366,16 +401,30 @@ func (b *batch) vaultLeaf(l leaf.Entry) (uint64, error) {
 		return 0, err
 	}
 	var loc vault.Loc
-	if base, ok := b.w.delta.Get(l.IssuanceDigest); ok && l.Type == leaf.TypeX509 && l.HasIssuanceDigest {
+	var baseID uint64
+	if base, bid, ok := b.w.delta.Get(l.IssuanceDigest); ok && l.Type == leaf.TypeX509 && l.HasIssuanceDigest {
 		if loc, err = b.w.vw.AppendDelta(id, l.CertDER, base); err != nil {
 			return 0, err
 		}
 		b.counts.DeltaRecords++
+		baseID = bid
+		if deltaSampled(sha) {
+			if err := b.sampleDelta(id, l.CertDER, loc); err != nil {
+				return 0, err
+			}
+		}
 	} else if loc, err = b.w.vw.AppendCert(vault.KindLeaf, id, l.CertDER, b.w.dictID); err != nil {
 		return 0, err
 	}
+	kind := derive.KindFinal
+	if l.Type == leaf.TypePrecert {
+		kind = derive.KindPrecert
+	}
+	if err := b.derive(l.CertDER, derive.Context{CertID: id, SHA256: sha, Kind: kind, Loc: loc, DeltaBaseCertID: baseID}); err != nil {
+		return 0, err
+	}
 	if l.Type == leaf.TypePrecert && l.HasIssuanceDigest {
-		b.w.delta.Put(l.IssuanceDigest, loc)
+		b.w.delta.Put(l.IssuanceDigest, loc, id)
 	}
 	return id, b.vaulted(sha, index.Ref{CertID: id, Loc: loc})
 }
@@ -407,6 +456,9 @@ func (b *batch) vaultChain(fps [][32]byte) ([32]byte, error) {
 		}
 		loc, err := b.w.vw.AppendCert(vault.KindChain, ids[i], der, b.w.dictID)
 		if err != nil {
+			return [32]byte{}, err
+		}
+		if err := b.derive(der, derive.Context{CertID: ids[i], SHA256: fp, Kind: derive.KindChain, Loc: loc}); err != nil {
 			return [32]byte{}, err
 		}
 		if err := b.vaulted(fp, index.Ref{CertID: ids[i], Loc: loc}); err != nil {
@@ -457,6 +509,11 @@ func (w *Writer) canary(b *batch, stage string) error {
 	rnd := rand.New(rand.NewPCG(b.rows[0].Idx, uint64(len(b.rows))))
 	if err := w.stager.Canary(b.ctx, stage, b.rows, b.chains, w.o.CanarySamples, rnd); err != nil {
 		return errRetry{err: err}
+	}
+	if b.dstage != nil {
+		if err := b.dstage.Canary(b.ctx, stage); err != nil {
+			return errRetry{err: err}
+		}
 	}
 	w.hook(HookDuringCanary)
 	r, err := vault.OpenReader(w.o.VaultDirs, w.codec)
@@ -596,4 +653,95 @@ func (w *Writer) incident(id commit.BatchID, sth logsource.SignedHead, first, se
 		return dir, err
 	}
 	return dir, fsutil.WriteFileAtomic(filepath.Join(dir, "incident.json"), b, 0o644)
+}
+
+// builders are the builders whose table ACTIVE.json lists as active or
+// building at this binary's version: every batch writes them (amendment A2
+// §4.6).
+func (w *Writer) builders() []derive.Builder {
+	if w.o.NoDerived {
+		return nil
+	}
+	var out []derive.Builder
+	for _, bl := range derive.Builders {
+		st := w.active.Tables[bl.Table().Name]
+		if v := bl.Table().Version; st.Active != nil && *st.Active == v || st.Building != nil && *st.Building == v {
+			out = append(out, bl)
+		}
+	}
+	return out
+}
+
+// derive extracts a newly vaulted certificate once and stages its rows in
+// every derived table of the batch.
+func (b *batch) derive(der []byte, ctx derive.Context) error {
+	if b.dstage == nil {
+		return nil
+	}
+	c := extract.Parse(der)
+	if b.parse == nil {
+		b.parse = map[string]int{}
+	}
+	b.parse[string(c.Status)]++
+	for i, bl := range b.builds {
+		if err := b.dstage.Add(i, bl.Build(c, ctx)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// tables records the derived tables this batch built, for _COMMIT.json.
+func (b *batch) tables() map[string]int {
+	out := map[string]int{}
+	for _, bl := range b.builds {
+		out[bl.Table().Name] = bl.Table().Version
+	}
+	return out
+}
+
+// deltaSampleDomain keeps the delta-saved sample apart from every other use
+// of a certificate's hash.
+var deltaSampleDomain = []byte("ctvault/delta-saved-sample/v1")
+
+// deltaSampled reports whether a leaf-delta certificate is in the
+// delta-saved sample: the first byte of SHA-256(domain ‖ certificate
+// SHA-256) is below 16, about 1 in 16, reproducible from the certificate
+// alone and uncorrelated with cert_id order (amendment A2 §6.1).
+func deltaSampled(sha [32]byte) bool {
+	h := sha256.Sum256(append(append([]byte(nil), deltaSampleDomain...), sha[:]...))
+	return h[0] < 16
+}
+
+// sampleDelta also compresses a sampled leaf-delta certificate as a full
+// record, to measure what the delta saved. Nothing is written.
+func (b *batch) sampleDelta(id uint64, der []byte, loc vault.Loc) error {
+	frame, err := b.w.codec.Compress(der, b.w.dictID)
+	if err != nil {
+		return err
+	}
+	full := len(vault.AppendRecord(nil, vault.Record{Kind: vault.KindLeaf, CertID: id, DictID: b.w.dictID, Frame: frame}))
+	b.deltaSamp++
+	b.deltaSaved += int64(full) - int64(loc.Len)
+	return nil
+}
+
+// fetchCounts is the attempt's fetcher statistics for _COMMIT.json.
+func (b *batch) fetchCounts() *commit.FetchCounts {
+	s := b.fetch
+	return &commit.FetchCounts{Requests: s.Requests, RateLimited: s.RateLimited,
+		Retries: s.RateLimited + s.ServerErrors + s.FramingErrors + s.NetworkErrors + s.OtherErrors}
+}
+
+// deltaSavedEstimate scales the sampled savings to every delta record; nil
+// when the batch wrote none.
+func (b *batch) deltaSavedEstimate() *commit.DeltaSaved {
+	if b.counts.DeltaRecords == 0 {
+		return nil
+	}
+	d := &commit.DeltaSaved{Approximate: true, DeltaRecords: b.counts.DeltaRecords, SampledRecords: b.deltaSamp, SampledSavedBytes: b.deltaSaved}
+	if b.deltaSamp > 0 {
+		d.Bytes = b.deltaSaved * int64(b.counts.DeltaRecords) / int64(b.deltaSamp)
+	}
+	return d
 }

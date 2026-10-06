@@ -8,10 +8,12 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	mrand "math/rand/v2"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -21,7 +23,9 @@ import (
 	"github.com/4rji/ctvault/internal/commit"
 	"github.com/4rji/ctvault/internal/config"
 	"github.com/4rji/ctvault/internal/dataset"
+	"github.com/4rji/ctvault/internal/derive"
 	"github.com/4rji/ctvault/internal/diskguard"
+	"github.com/4rji/ctvault/internal/extract"
 	"github.com/4rji/ctvault/internal/fetch"
 	"github.com/4rji/ctvault/internal/index"
 	"github.com/4rji/ctvault/internal/ingest"
@@ -211,6 +215,44 @@ func TestCanonicalIngestEndToEnd(t *testing.T) {
 		t.Fatalf("literal issuer_key_hash lookup: %d rows, want %d", got, rows)
 	}
 
+	// Derived tables (amendment A2 §4): every batch built them, ACTIVE.json
+	// is complete, every vaulted certificate has one certs row, every entry
+	// joins its certificate, and kinds agree with the entry types.
+	if a, ok, err := derive.ReadActive(r.v.Root); err != nil || !ok || !a.AllComplete() {
+		t.Fatalf("ACTIVE.json: %+v %v %v", a, ok, err)
+	}
+	var newCerts int64
+	for _, m := range ms {
+		if m.Builders[derive.CertsV1.Name] != derive.CertsV1.Version || m.Builders[derive.NamesV1.Name] != derive.NamesV1.Version {
+			t.Fatalf("batch %s built %v", m.BatchID, m.Builders)
+		}
+		newCerts += int64(m.Counts.NewCerts)
+	}
+	if got := queryInt(t, db, `SELECT count(*) FROM certs`); got != newCerts {
+		t.Fatalf("certs: %d rows for %d vaulted certificates", got, newCerts)
+	}
+	if a, b := queryInt(t, db, `SELECT count(*) FROM entries WHERE cert_id IS NOT NULL`), queryInt(t, db, `SELECT count(*) FROM entry_certs`); a != b || a == 0 {
+		t.Fatalf("%d entries have a certificate, %d join certs", a, b)
+	}
+	if got := queryInt(t, db, `SELECT count(*) FROM entry_certs
+		WHERE NOT (entry_type = 'precert' AND kind = 'precert' OR entry_type = 'x509' AND kind IN ('final', 'chain'))`); got != 0 {
+		t.Fatalf("%d entries disagree with their certificate's kind", got)
+	}
+	if got := queryInt(t, db, `SELECT count(*) FROM logging_delay WHERE logging_delay IS NOT NULL`); got == 0 {
+		t.Fatal("logging_delay has no values")
+	}
+	// Literal lookups on the bloom-filtered columns find every row.
+	var top string
+	if err := db.QueryRow(`SELECT name, count(*) FROM names WHERE dns_valid GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT 1`).Scan(&top, &rows); err != nil {
+		t.Fatal(err)
+	}
+	if got := queryInt(t, db, `SELECT count(*) FROM names WHERE name = '`+top+`'`); got != rows || rows == 0 {
+		t.Fatalf("literal names lookup of %s: %d rows, want %d", top, got, rows)
+	}
+	t.Logf("derived: %d certs rows, %d names rows (%d dns_valid), %d entries joined to certs", newCerts,
+		queryInt(t, db, `SELECT count(*) FROM names`), queryInt(t, db, `SELECT count(*) FROM names WHERE dns_valid`),
+		queryInt(t, db, `SELECT count(*) FROM entry_certs`))
+
 	// Certificates read back through Pebble and the vault, verified.
 	idx, err := index.Open(filepath.Join(r.v.Root, "state", "pebble"))
 	if err != nil {
@@ -249,6 +291,17 @@ func TestCanonicalIngestEndToEnd(t *testing.T) {
 		if c := queryInt(t, db, `SELECT count(*) FROM entries WHERE idx = ? AND cert_id = ?`, i, ref.CertID); c != 1 {
 			t.Fatalf("entry %d: entries.parquet does not point at cert_id %d", i, ref.CertID)
 		}
+		// Its derived rows, found by a literal sha256, match the extractor.
+		c := extract.Parse(der)
+		var status, issuer string
+		var dns int64
+		if err := db.QueryRow(fmt.Sprintf(`SELECT parse_status, coalesce(issuer_der, ''), n_dns_names FROM certs WHERE sha256 = '%x' AND cert_id = %d`, sha, ref.CertID)).
+			Scan(&status, &issuer, &dns); err != nil || status != string(c.Status) || issuer != hex.EncodeToString(c.Issuer.Raw) || dns != int64(len(c.DNSNames)) {
+			t.Fatalf("entry %d: certs row (%s, %s, %d) differs from the extractor's %+v: %v", i, status, issuer, dns, c, err)
+		}
+		if got, want := queryInt(t, db, `SELECT count(*) FROM names WHERE cert_id = ?`, ref.CertID), len(derive.Names{}.Build(c, derive.Context{CertID: ref.CertID})); got != int64(want) {
+			t.Fatalf("entry %d: %d names rows, the builder gives %d", i, got, want)
+		}
 	}
 }
 
@@ -264,6 +317,9 @@ func TestRecoveryEquivalenceOnRealData(t *testing.T) {
 	clean.ingest(cw, n, size)
 	cw.Close()
 	want := clean.v.Dump(t)
+	if len(want.Certs) == 0 {
+		t.Fatal("the clean ingest has no derived rows")
+	}
 
 	r := newRealVault(t, s, dict)
 	crashes := []struct {
@@ -320,6 +376,62 @@ func TestRecoveryEquivalenceOnRealData(t *testing.T) {
 		len(crashes), len(ms), n, got, want2)
 }
 
+// TestRebuildEquivalenceOnRealData is amendment A2 §5.7's essential test on
+// the canonical sample: ingested with the builders off and then rebuilt,
+// every batch's certs and names files are byte-identical to an ingest with
+// the builders on. No dictionary is trained, so both vaults hold the same
+// records at the same locations.
+func TestRebuildEquivalenceOnRealData(t *testing.T) {
+	s := sampletest.Canonical(t, realLog)
+	n := s.Manifest.Count
+	sums := func(root string) []string {
+		ms, err := commit.ListCommitted(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for _, m := range ms {
+			for _, b := range derive.Builders {
+				fi, ok := m.Listed(b.Table().File())
+				if !ok {
+					t.Fatalf("batch %s lists no %s", m.BatchID, b.Table().File())
+				}
+				out = append(out, m.BatchID+" "+b.Table().File()+" "+fi.SHA256)
+			}
+		}
+		return out
+	}
+	on := newRealVault(t, s, 1<<30)
+	w := on.open()
+	on.ingest(w, n, 10000)
+	w.Close()
+
+	off := newRealVault(t, s, 1<<30)
+	off.opts.NoDerived = true
+	w = off.open()
+	off.ingest(w, n, 10000)
+	w.Close()
+	off.opts.NoDerived = false
+	if err := os.Remove(filepath.Join(off.v.Root, "dataset", derive.ActiveFile)); err != nil {
+		t.Fatal(err)
+	}
+	w = off.open()
+	start := time.Now()
+	st, err := w.Rebuild(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	took := time.Since(start)
+	w.Close()
+	if got, want := sums(off.v.Root), sums(on.v.Root); !slices.Equal(got, want) || !st.Switched {
+		t.Fatalf("rebuilt files differ from an ingest with the builders on (switched %v):\n%s\nwant\n%s",
+			st.Switched, strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	off.v.CheckRecovered(t)
+	t.Logf("rebuilt %d batches of %d real entries in %v (%d certs rows, %d names rows): byte-identical to ingest",
+		st.Batches, n, took.Round(time.Millisecond), st.Rows["certs"], st.Rows["names"])
+}
+
 func lastNext(t *testing.T, root string) uint64 {
 	ms, err := commit.ListCommitted(root)
 	if err != nil || len(ms) == 0 {
@@ -342,7 +454,7 @@ func TestMeasurementReports(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(r.Provenance.Dependencies) != 4 {
+			if len(r.Provenance.Dependencies) != 5 {
 				t.Fatalf("provenance lacks dependency versions: %v", r.Provenance.Dependencies)
 			}
 			if r.Errors.Total != r.Errors.Committed || r.Sizes.Vault <= 0 || r.Sizes.Parquet <= 0 || r.Sizes.Pebble <= 0 {

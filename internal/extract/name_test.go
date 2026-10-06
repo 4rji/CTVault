@@ -142,3 +142,13 @@ func TestNameUnreadable(t *testing.T) {
 		}
 	}
 }
+
+func TestNameValues(t *testing.T) {
+	n, _ := parseName(buildName([]atv{{oidCN, str(tagUTF8, "first")}}, []atv{{oidO, str(tagUTF8, "Org")}}, []atv{{oidCN, str(tagUTF8, "second\xff")}}))
+	if got := n.Values(OIDCommonName); len(got) != 2 || got[0] != "first" || got[1] != `second\FF` {
+		t.Errorf("Values(CN) = %q", got)
+	}
+	if got := n.Values("2.5.4.11"); got != nil {
+		t.Errorf("Values of a missing type = %q", got)
+	}
+}

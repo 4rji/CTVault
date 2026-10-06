@@ -1,0 +1,30 @@
+query: example.com issuer:"Let's Encrypt" since:2026-10 kind:final
+[names] certs  issuances
+   NAME                                     FIRST SEEN LAST SEEN  CERTS ISSUERS
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+─ detail ───────────────────────────────────────────────────────────────────────────────────────────
+Type a query and press Enter: a domain, or suffix:, exact:, ip:, contains: or regex:, then filters.
+Tab switches names, certs and issuances; ? shows every key.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+certs v1 ✓ · names v1 ✓ · as-of commit 3                                                     [?]help

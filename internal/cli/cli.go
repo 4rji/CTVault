@@ -100,7 +100,7 @@ func newRootCmd(a *app) *cobra.Command {
 	}
 	root.PersistentFlags().StringVar(&a.root, "root", a.d.Getenv("CTVAULT_ROOT"), "vault root (default $CTVAULT_ROOT)")
 	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return exitcode.With(exitcode.Usage, err) })
-	root.AddCommand(newVersionCmd(a), newInitCmd(a), newLogsCmd(a), newVaultCmd(a), newUpdateCmd(a), newExplainCmd(a))
+	root.AddCommand(newVersionCmd(a), newInitCmd(a), newLogsCmd(a), newVaultCmd(a), newUpdateCmd(a), newStatsCmd(a), newSearchCmd(a), newFetchCmd(a), newRebuildCmd(a), newRepairCmd(a), newExplainCmd(a), newExploreCmd(a))
 	for _, extra := range extraCommands {
 		root.AddCommand(extra(a))
 	}

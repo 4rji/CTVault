@@ -136,6 +136,19 @@ func (x *Index) AppliedLogs() (map[string]uint64, error) {
 	return out, it.Error()
 }
 
+// HasChain reports whether chain id is recorded.
+func (x *Index) HasChain(id [32]byte) (bool, error) {
+	_, cl, err := x.db.Get(chainKey(id))
+	if errors.Is(err, pebble.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	cl.Close()
+	return true, nil
+}
+
 // EachCert calls fn for every vaulted certificate, in SHA-256 order (for
 // checks that compare the index with the vault).
 func (x *Index) EachCert(fn func(sha [32]byte, r Ref) error) error {

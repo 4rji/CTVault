@@ -45,6 +45,10 @@ func (p Paths) BatchDir(b BatchID) string {
 	return filepath.Join(p.Root, "dataset", "log="+b.Log, "batch="+b.span())
 }
 func (p Paths) StageDir(b BatchID) string { return filepath.Join(p.Root, "tmp", "stage", b.file()) }
+
+// RebuildDir is where a rebuild stages a committed batch's derived files
+// (amendment A2 §5.2).
+func (p Paths) RebuildDir(b BatchID) string { return filepath.Join(p.Root, "tmp", "rebuild", b.file()) }
 func (p Paths) IntentPath(b BatchID) string {
 	return filepath.Join(p.Root, "state", "intent", b.file()+".json")
 }
@@ -80,6 +84,27 @@ type Counts struct {
 	VaultBytes   uint64 `json:"vault_bytes"`
 }
 
+// FetchCounts are the fetcher's statistics for the batch's committed
+// attempt (amendment A2 §6.1).
+type FetchCounts struct {
+	Requests    int64 `json:"requests"`
+	RateLimited int64 `json:"rate_limited"` // HTTP 429
+	Retries     int64 `json:"retries"`      // requests repeated after a 429, a 5xx, a malformed response or a network error
+}
+
+// DeltaSaved estimates the bytes the batch's leaf-delta records saved
+// against full records (amendment A2 §6.1). It is approximate: about 1 in 16
+// delta records, chosen by a stable hash of the certificate, is also
+// compressed as a full record, and the measured saving is scaled to every
+// delta record.
+type DeltaSaved struct {
+	Approximate       bool  `json:"approximate"` // always true
+	Bytes             int64 `json:"bytes"`       // the estimate; 0 with no sampled record
+	DeltaRecords      int   `json:"delta_records"`
+	SampledRecords    int   `json:"sampled_records"`
+	SampledSavedBytes int64 `json:"sampled_saved_bytes"`
+}
+
 // DictInfo records the dictionary new records used and any training
 // failure (amendment A1 §5).
 type DictInfo struct {
@@ -87,7 +112,7 @@ type DictInfo struct {
 	TrainingError string `json:"training_error,omitempty"`
 }
 
-// Manifest is _COMMIT.json (spec §8.4, Plan 2 subset: no derived builders yet).
+// Manifest is _COMMIT.json (spec §8.4).
 type Manifest struct {
 	Format         int                         `json:"format"`
 	CommitSeq      uint64                      `json:"commit_seq"`
@@ -104,9 +129,16 @@ type Manifest struct {
 	Builders       map[string]int              `json:"builders"`
 	Files          map[string]dataset.FileInfo `json:"files"`
 	Counts         Counts                      `json:"counts"`
+	Fetch          *FetchCounts                `json:"fetch,omitempty"`
+	ParseStatus    map[string]int              `json:"parse_status,omitempty"` // the new certificates' parse_status mix
+	DeltaSaved     *DeltaSaved                 `json:"delta_saved,omitempty"`
 	Dictionary     DictInfo                    `json:"dictionary"`
 	CTVaultVersion string                      `json:"ctvault_version"`
 	CommittedAt    time.Time                   `json:"committed_at"`
+
+	// Derived is the batch's _DERIVED.json, nil when it has none. It is not
+	// part of _COMMIT.json.
+	Derived *Derived `json:"-"`
 }
 
 // ID returns the manifest's batch ID.
@@ -138,9 +170,23 @@ func readManifest(dir, log, span string) (Manifest, error) {
 			return m, corrupt("%s/%s does not list %s", dir, ManifestFile, name)
 		}
 	}
+	d, ok, err := ReadDerived(dir, m.ID())
+	if err != nil {
+		return m, err
+	}
+	if ok {
+		m.Derived = &d
+	}
+	sizes := map[string]int64{}
 	for name, fi := range m.Files {
+		sizes[name] = fi.Bytes
+	}
+	for _, t := range d.Tables {
+		sizes[t.File] = t.Bytes
+	}
+	for name, size := range sizes {
 		st, err := os.Stat(filepath.Join(dir, name))
-		if err != nil || st.Size() != fi.Bytes {
+		if err != nil || st.Size() != size {
 			return m, corrupt("%s/%s is missing or has the wrong size", dir, name)
 		}
 	}

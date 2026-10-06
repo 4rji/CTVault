@@ -49,6 +49,8 @@ type crashConfig struct {
 	BatchSize uint64
 	KillAt    string // a hook point; "" runs to the end
 	KillNth   int    // die the nth time KillAt fires
+	Mode      string // "" ingests; "rebuild" or "reindex" runs that instead
+	NoDerived bool   // ingest without derived files, as Plan 2 did
 }
 
 // options is the writer configuration of every crash test: small segments
@@ -90,11 +92,23 @@ func TestCrashChild(t *testing.T) {
 			}
 		}
 	}
-	w, err := ingest.Open(options(c.Root, hook))
+	if c.Mode == "reindex" {
+		reindexChild(t, c.Root, hook)
+		return
+	}
+	o := options(c.Root, hook)
+	o.NoDerived = c.NoDerived
+	w, err := ingest.Open(o)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer w.Close()
+	if c.Mode == "rebuild" {
+		if _, err := w.Rebuild(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
 	pub, err := x509.ParsePKIXPublicKey(c.PublicKey)
 	if err != nil {
 		t.Fatal(err)
@@ -211,8 +225,10 @@ func (r *crashRun) restart() {
 }
 
 // clean ingests the whole log in a child that is never killed and returns
-// its content and how long the child took.
-func clean(t *testing.T, l *ctlogtest.Log, end, batch uint64) (map[string][]vaulttest.Entry, time.Duration) {
+// its content and how long the child took. The content holds derived rows
+// for every certificate an entry references (amendment A2 §4), so the
+// comparisons below cover the derived files too.
+func clean(t *testing.T, l *ctlogtest.Log, end, batch uint64) (vaulttest.Content, time.Duration) {
 	t.Helper()
 	r := newCrashRun(t, l, end, batch)
 	start := time.Now()
@@ -221,7 +237,15 @@ func clean(t *testing.T, l *ctlogtest.Log, end, batch uint64) (map[string][]vaul
 	}
 	took := time.Since(start)
 	r.restart()
-	return r.v.Dump(t), took
+	c := r.v.Dump(t)
+	for _, es := range c.Entries {
+		for _, e := range es {
+			if _, ok := c.Certs[e.Cert]; e.Cert != "" && !ok {
+				t.Fatalf("entry %d: certificate %s has no derived rows", e.Idx, e.Cert)
+			}
+		}
+	}
+	return c, took
 }
 
 const (
@@ -258,6 +282,7 @@ func TestCrashAtEveryBoundary(t *testing.T) {
 		{ingest.HookBeforePebble, 2},
 		{ingest.HookAfterPebble, 2},
 		{commit.HookBeforeIntentDelete, 2},
+		{ingest.HookDuringAudit, 2}, // P11: the batch stays committed
 	} {
 		t.Run(b.point, func(t *testing.T) {
 			r := newCrashRun(t, l, crashEntries, crashBatch)

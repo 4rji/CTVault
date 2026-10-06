@@ -1,0 +1,50 @@
+package cli
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/4rji/ctvault/internal/ctlogtest"
+	"github.com/4rji/ctvault/internal/derive"
+	"github.com/4rji/ctvault/internal/exitcode"
+	"github.com/4rji/ctvault/internal/ingest"
+)
+
+// TestRebuildCommand: rebuild has nothing to do on a complete vault; on a
+// vault whose tables are building, update warns and rebuild switches them
+// to complete (amendment A2 §5.2, §5.5).
+func TestRebuildCommand(t *testing.T) {
+	e, _ := updateEnv(t, 80, ctlogtest.Options{})
+	e.mustRun("--root", e.root, "update")
+	if out := e.mustRun("--root", e.root, "rebuild"); !strings.Contains(out, "nothing to rebuild") {
+		t.Fatalf("rebuild on a complete vault: %s", out)
+	}
+	if err := os.Remove(filepath.Join(e.root, "dataset", derive.ActiveFile)); err != nil {
+		t.Fatal(err)
+	}
+	e.mustRun("--root", e.root, "update")
+	if msg := e.stderr.String(); !strings.Contains(msg, "certs and names are being built: run `ctvault rebuild`") {
+		t.Fatalf("update on a building vault warns: %q", msg)
+	}
+	out := e.mustRun("--root", e.root, "rebuild")
+	if a, _, _ := derive.ReadActive(e.root); !a.AllComplete() || !strings.Contains(out, "certs and names are complete") {
+		t.Fatalf("rebuild: %+v\n%s", a, out)
+	}
+	e.mustRun("--root", e.root, "update")
+	if msg := e.stderr.String(); strings.Contains(msg, "being built") {
+		t.Fatalf("update after the rebuild still warns: %q", msg)
+	}
+}
+
+// TestRebuildErrorsAreVerificationFailures: an index or dataset
+// inconsistency exits 5, like corruption (amendment A2 §5.2).
+func TestRebuildErrorsAreVerificationFailures(t *testing.T) {
+	for _, err := range []error{ingest.ErrIndexInconsistent, ingest.ErrDatasetInconsistent} {
+		if got := exitcode.Of(ingestErr(fmt.Errorf("rebuilding batch x: %w", err))); got != exitcode.Verification {
+			t.Errorf("%v: exit %d", err, got)
+		}
+	}
+}

@@ -94,21 +94,21 @@ func TestDeltaCorruption(t *testing.T) {
 func TestDeltaCache(t *testing.T) {
 	c := NewDeltaCache(3)
 	for i := range 4 {
-		c.Put([32]byte{byte(i + 1)}, Loc{Segment: uint64(i)})
+		c.Put([32]byte{byte(i + 1)}, Loc{Segment: uint64(i)}, uint64(100+i))
 	}
-	if _, ok := c.Get([32]byte{1}); ok || c.Len() != 3 {
+	if _, _, ok := c.Get([32]byte{1}); ok || c.Len() != 3 {
 		t.Fatalf("the oldest entry is evicted at capacity: len %d", c.Len())
 	}
-	if l, ok := c.Get([32]byte{4}); !ok || l.Segment != 3 {
+	if l, id, ok := c.Get([32]byte{4}); !ok || l.Segment != 3 || id != 103 {
 		t.Fatal("the newest entry is cached")
 	}
-	c.Put([32]byte{4}, Loc{Segment: 9})
-	if l, _ := c.Get([32]byte{4}); l.Segment != 9 || c.Len() != 3 {
+	c.Put([32]byte{4}, Loc{Segment: 9}, 109)
+	if l, id, _ := c.Get([32]byte{4}); l.Segment != 9 || id != 109 || c.Len() != 3 {
 		t.Fatal("re-putting a digest updates it in place")
 	}
 	off := NewDeltaCache(0)
-	off.Put([32]byte{1}, Loc{})
-	if _, ok := off.Get([32]byte{1}); ok {
+	off.Put([32]byte{1}, Loc{}, 1)
+	if _, _, ok := off.Get([32]byte{1}); ok {
 		t.Fatal("capacity 0 disables the cache")
 	}
 }
@@ -123,6 +123,7 @@ func TestWarmFindsPrecertsInRanges(t *testing.T) {
 	var rs []Range
 	var finalDigests [][32]byte
 	var preLocs []Loc
+	var preIDs []uint64
 	id := uint64(0)
 	for batch := range 3 {
 		start := w.Tail()
@@ -133,6 +134,7 @@ func TestWarmFindsPrecertsInRanges(t *testing.T) {
 			id++
 			w.AppendCert(KindLeaf, id, f.CertDER, 0)
 			preLocs = append(preLocs, l)
+			preIDs = append(preIDs, id-1)
 			finalDigests = append(finalDigests, leaf.Decode(f.LeafInput, f.ExtraData).IssuanceDigest)
 		}
 		rs = append(rs, Range{Start: start, End: w.Tail()})
@@ -146,11 +148,11 @@ func TestWarmFindsPrecertsInRanges(t *testing.T) {
 	if c.Len() != 6 {
 		t.Fatalf("two batches hold 6 precerts (finals are not cached): %d", c.Len())
 	}
-	if _, ok := c.Get(finalDigests[0]); ok {
+	if _, _, ok := c.Get(finalDigests[0]); ok {
 		t.Fatal("the first batch was outside the warm-up window")
 	}
-	if l, ok := c.Get(finalDigests[4]); !ok || l != preLocs[4] {
-		t.Fatalf("final 4 must find its precert: %+v %v", l, ok)
+	if l, id, ok := c.Get(finalDigests[4]); !ok || l != preLocs[4] || id != preIDs[4] {
+		t.Fatalf("final 4 must find its precert and its cert_id %d: %+v %d %v", preIDs[4], l, id, ok)
 	}
 }
 
@@ -160,19 +162,19 @@ func TestDeltaCacheNeedsTheFullDigest(t *testing.T) {
 	c := NewDeltaCache(10)
 	a, b := [32]byte{7}, [32]byte{7}
 	b[31] = 1
-	c.Put(a, Loc{Segment: 1})
-	if _, ok := c.Get(b); ok {
+	c.Put(a, Loc{Segment: 1}, 1)
+	if _, _, ok := c.Get(b); ok {
 		t.Fatal("a 16-byte prefix match is not a hit")
 	}
-	c.Put(b, Loc{Segment: 2})
-	if l, ok := c.Get(b); !ok || l.Segment != 2 {
+	c.Put(b, Loc{Segment: 2}, 2)
+	if l, _, ok := c.Get(b); !ok || l.Segment != 2 {
 		t.Fatal("the newer of two colliding digests wins")
 	}
-	if _, ok := c.Get(a); ok {
+	if _, _, ok := c.Get(a); ok {
 		t.Fatal("the displaced digest misses (stored in full instead)")
 	}
 	for i := range 20 { // wrap the ring past the displaced slot
-		c.Put([32]byte{byte(100 + i)}, Loc{Segment: uint64(i)})
+		c.Put([32]byte{byte(100 + i)}, Loc{Segment: uint64(i)}, uint64(i))
 	}
 	if c.Len() != 10 {
 		t.Fatalf("len %d after wrapping, want 10", c.Len())

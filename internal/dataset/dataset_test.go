@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"github.com/4rji/ctvault/internal/derive"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
@@ -179,10 +180,10 @@ func TestViewsSeeCommittedBatchesOnly(t *testing.T) {
 	if _, err := s.Stage(ctx, filepath.Join(root, "tmp", "stage", "x"), es, cs); err != nil {
 		t.Fatal(err)
 	}
-	if changed, err := WriteViews(root); err != nil || !changed {
+	if changed, err := WriteViews(root, derive.Complete()); err != nil || !changed {
 		t.Fatalf("first write: %v %v", changed, err)
 	}
-	if changed, _ := WriteViews(root); changed {
+	if changed, _ := WriteViews(root, derive.Complete()); changed {
 		t.Fatal("views.sql is rewritten only when it changes")
 	}
 	v, _ := os.ReadFile(filepath.Join(root, ViewsFile))

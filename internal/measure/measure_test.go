@@ -72,7 +72,7 @@ func options(t *testing.T, base string) Options {
 	}
 	return Options{Base: base, Version: "test", Now: func() time.Time { return now }, Stat: free,
 		BatchSize: 32, DictSamples: 16, CanarySamples: 8,
-		Dependencies: map[string]string{"github.com/klauspost/compress": "v1.20.1"}}
+		Dependencies: map[string]string{"github.com/klauspost/compress": "v1.20.1", "github.com/DataDog/zstd": "v1.5.7"}}
 }
 
 // TestMeasureCanonical runs a canonical sample with known contents: 46
@@ -146,8 +146,18 @@ func TestMeasureCanonical(t *testing.T) {
 	// A test binary's build info lists no dependencies; the caller's
 	// versions are used and labelled.
 	p := r.Provenance
-	if p.Dependencies["github.com/klauspost/compress"] != "v1.20.1" || p.DependenciesFrom != "go.mod" || p.ZstdLibrary != "github.com/klauspost/compress v1.20.1" {
+	if p.Dependencies["github.com/klauspost/compress"] != "v1.20.1" || p.Dependencies["github.com/DataDog/zstd"] != "v1.5.7" ||
+		p.DependenciesFrom != "go.mod" || p.ZstdLibrary != "libzstd 1.5.7" {
 		t.Fatalf("dependencies %v from %q, zstd %q", p.Dependencies, p.DependenciesFrom, p.ZstdLibrary)
+	}
+	// The derived tables (amendment A2 §7).
+	if d := r.Derived; d.CertsRows == 0 || d.NamesRows < d.CertsRows || d.CertsBytesPerEntry <= 0 || d.NamesPerCert <= 0 ||
+		d.ParseStatus["ok"] != d.CertsRows || d.ExtractMicrosPerCert <= 0 || d.ExtractedForTimingRecords != d.CertsRows ||
+		r.Sizes.ParquetByFile["certs.p1.parquet"] <= 0 {
+		t.Fatalf("derived %+v, Parquet by file %v", d, r.Sizes.ParquetByFile)
+	}
+	if md := Markdown(r); !strings.Contains(md, "## Derived tables") || !strings.Contains(md, "libzstd level 9") {
+		t.Fatalf("Markdown lacks the derived tables or the compression note:\n%s", md)
 	}
 	// The report is written, the workspace is gone.
 	wantDir := filepath.Join(base, "reports", "fakelog", "000000000000-000000000095")

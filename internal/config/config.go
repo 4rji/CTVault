@@ -38,6 +38,9 @@ type Ingest struct {
 	FollowInterval  Duration `toml:"follow_interval"`
 	StallTimeout    Duration `toml:"stall_timeout"`
 	DeltaLRUEntries int      `toml:"delta_lru_entries"`
+	// PostCommitAudit runs the post-commit audit after every batch (spec
+	// §8.3 P11, amendment A3 §6).
+	PostCommitAudit bool `toml:"post_commit_audit"`
 }
 
 // Fetch bounds the fetcher's reorder buffer (amendment A1 §4): workers pause
@@ -111,7 +114,8 @@ func (s *Size) UnmarshalText(b []byte) error {
 func Default() Config {
 	return Config{
 		Ingest: Ingest{BatchSize: 500000, Workers: 4, MaxRPS: 20,
-			FollowInterval: Duration{10 * time.Minute}, StallTimeout: Duration{15 * time.Minute}, DeltaLRUEntries: 2000000},
+			FollowInterval: Duration{10 * time.Minute}, StallTimeout: Duration{15 * time.Minute}, DeltaLRUEntries: 2000000,
+			PostCommitAudit: true},
 		Fetch:   Fetch{MaxBufferedEntries: 65536, MaxBufferedBytes: 256 << 20},
 		Delta:   Delta{WarmBatches: 4},
 		Vault:   Vault{SegmentSize: 1 << 30},
@@ -131,6 +135,7 @@ max_rps = 20.0
 follow_interval = "10m"
 stall_timeout = "15m"
 delta_lru_entries = 2000000
+post_commit_audit = true
 
 [fetch]
 max_buffered_entries = 65536

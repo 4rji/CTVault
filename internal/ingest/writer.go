@@ -14,6 +14,7 @@ import (
 	"github.com/4rji/ctvault/internal/commit"
 	"github.com/4rji/ctvault/internal/config"
 	"github.com/4rji/ctvault/internal/dataset"
+	"github.com/4rji/ctvault/internal/derive"
 	"github.com/4rji/ctvault/internal/diskguard"
 	"github.com/4rji/ctvault/internal/fetch"
 	"github.com/4rji/ctvault/internal/index"
@@ -46,6 +47,9 @@ type Options struct {
 	// CanarySamples is how many rows and vault records the canary checks
 	// per batch (default 64).
 	CanarySamples int
+	// NoDerived writes batches without derived files, as Plan 2 did: tests
+	// only, for the rebuild's byte-equivalence test (amendment A2 §5.7).
+	NoDerived bool
 }
 
 // Writer is the single writer of a vault.
@@ -67,6 +71,7 @@ type Writer struct {
 
 	committed []commit.Manifest
 	tips      map[string]commit.LogTip
+	active    derive.Active // dataset/ACTIVE.json
 }
 
 func (w *Writer) logf(format string, args ...any) {
@@ -150,7 +155,10 @@ func Open(o Options) (*Writer, error) {
 	if err := w.warm(); err != nil {
 		return nil, err
 	}
-	if _, err := dataset.WriteViews(o.Root); err != nil {
+	if w.active, err = settleActive(o.Root, len(rec.Committed) > 0); err != nil {
+		return nil, err
+	}
+	if _, err := dataset.WriteViews(o.Root, w.active); err != nil {
 		return nil, err
 	}
 	ok = true
@@ -200,6 +208,30 @@ func (w *Writer) warm() error {
 	}
 	return vault.Warm(w.o.VaultDirs, w.codec, w.delta, ranges, leaf.PrecertIssuanceDigest)
 }
+
+// settleActive reads dataset/ACTIVE.json, or creates it (amendment A2 §4.6):
+// complete for a vault without batches, which has nothing to backfill, and
+// building for a vault written before Plan 3. A state this binary cannot
+// honour is refused.
+func settleActive(root string, committed bool) (derive.Active, error) {
+	a, ok, err := derive.ReadActive(root)
+	if err != nil {
+		return a, err
+	}
+	if !ok {
+		a = derive.Complete()
+		if committed {
+			a = derive.Upgrading()
+		}
+		if err := derive.WriteActive(root, a); err != nil {
+			return a, err
+		}
+	}
+	return a, a.Check()
+}
+
+// Active returns the vault's ACTIVE.json state.
+func (w *Writer) Active() derive.Active { return w.active }
 
 // Next returns the first index of log not yet committed.
 func (w *Writer) Next(log string) uint64 { return w.tips[log].Next }

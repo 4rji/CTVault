@@ -1,0 +1,30 @@
+query: example.test
+[names] certs  issuances  · sort last_seen desc
+   NAME                                     FIRST SEEN LAST SEEN  CERTS ISSUERS
+   host29.example.test                      2026-09-21 2026-09-21 2     CTVault Test CA, CTVault T…
+   www.host29.example.test                  2026-09-21 2026-09-21 2     CTVault Test CA, CTVault T…
+ ● host28.example.test                      2026-09-21 2026-09-21 2     CTVault Test CA
+▸  www.host28.example.test                  2026-09-21 2026-09-21 2     CTVault Test CA
+   host27.example.test                      2026-09-21 2026-09-21 2     CTVault Test CA
+   www.host27.example.test                  2026-09-21 2026-09-21 2     CTVault Test CA
+   host26.example.test                      2026-09-21 2026-09-21 2     CTVault Test CA, CTVault T…
+   www.host26.example.test                  2026-09-21 2026-09-21 2     CTVault Test CA, CTVault T…
+   host25.example.test                      2026-09-21 2026-09-21 2     CTVault Test CA
+   www.host25.example.test                  2026-09-21 2026-09-21 2     CTVault Test CA
+   host24.example.test                      2026-09-21 2026-09-21 2     CTVault Test CA
+   www.host24.example.test                  2026-09-21 2026-09-21 2     CTVault Test CA
+   host23.example.test                      2026-09-21 2026-09-21 2     CTVault Test CA, CTVault T…
+   www.host23.example.test                  2026-09-21 2026-09-21 2     CTVault Test CA, CTVault T…
+   host22.example.test                      2026-09-21 2026-09-21 2     CTVault Test CA
+   www.host22.example.test                  2026-09-21 2026-09-21 2     CTVault Test CA
+   host21.example.test                      2026-09-21 2026-09-21 2     CTVault Test CA
+   www.host21.example.test                  2026-09-21 2026-09-21 2     CTVault Test CA
+   host20.example.test                      2026-09-21 2026-09-21 2     CTVault Test CA, CTVault T…
+   www.host20.example.test                  2026-09-21 2026-09-21 2     CTVault Test CA, CTVault T…
+   host19.example.test                      2026-09-21 2026-09-21 2     CTVault Test CA
+─ detail ───────────────────────────────────────────────────────────────────────────────────────────
+name www.host28.example.test · first_seen 2026-09-21T14:14:16Z · last_seen 2026-09-21T14:14:17Z
+certs 2 · issuers CTVault Test CA
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+60 names · 42 ms · 1 marked · certs v1 ✓ · names v1 ✓ · as-of commit 3                       [?]help

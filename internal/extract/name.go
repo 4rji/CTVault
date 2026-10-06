@@ -237,6 +237,25 @@ func (n Name) First(oid string) (string, bool) {
 	return "", false
 }
 
+// Values returns the display value of every attribute of type oid, in DER
+// order; nil when there is none.
+func (n Name) Values(oid string) []string {
+	var out []string
+	for _, rdn := range n.RDNs {
+		for _, a := range rdn {
+			if a.Type != oid {
+				continue
+			}
+			if d, ok := decode(a.Tag, a.Value); ok {
+				out = append(out, d.display())
+			} else {
+				out = append(out, "#"+hex.EncodeToString(a.Element))
+			}
+		}
+	}
+	return out
+}
+
 // badStrings reports whether any string value has bytes invalid for its
 // type (NameBadString).
 func (n Name) badStrings() bool {

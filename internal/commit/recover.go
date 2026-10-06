@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/4rji/ctvault/internal/dataset"
@@ -56,7 +57,8 @@ func (r Recovered) LastSeq() uint64 {
 //     before committing anything (spec §8.6: IDs are never reused).
 //  4. Only tmp/stage/* and tmp/rebuild/* are cleaned (amendment A1 §7),
 //     plus the temp files of interrupted atomic writes in the vault's
-//     metadata folders.
+//     metadata folders, derived files a batch's manifests do not list, and
+//     a leftover state/pebble.reindex (amendment A2 §5.5).
 //  5. Every committed segment must exist and carry this vault's UUID.
 //  6. Pebble catches up on committed batches it has not applied, by
 //     re-reading their vault ranges and chains.parquet; this is idempotent.
@@ -159,6 +161,19 @@ func Recover(o RecoverOptions) (Recovered, error) {
 		}
 	}
 
+	if err := removeUnlistedDerived(o, committed, &r); err != nil {
+		return r, err
+	}
+	for _, name := range []string{ReindexDir, probeA, probeB} {
+		p := filepath.Join(o.Paths.StateDir(), name)
+		if _, err := os.Stat(p); err == nil {
+			if err := os.RemoveAll(p); err != nil {
+				return r, err
+			}
+			r.Actions = append(r.Actions, "removed the leftover of an interrupted repair --reindex: state/"+name)
+		}
+	}
+
 	if err := removeInterruptedWrites(o, &r); err != nil {
 		return r, err
 	}
@@ -209,37 +224,56 @@ func catchUp(o RecoverOptions, committed []Manifest, r *Recovered) error {
 				return err
 			}
 		}
-		b := o.Index.NewBatch()
-		err := vault.Scan(o.VaultDirs, m.Vault.Start, m.Vault.End, func(loc vault.Loc, rec vault.Record) error {
-			der, _, err := reader.Read(loc)
-			if err != nil {
-				return err
-			}
-			return b.AddCert(sha256.Sum256(der), index.Ref{CertID: rec.CertID, Loc: loc})
-		})
-		if err == nil {
-			var ids [][32]byte
-			ids, err = o.ChainIDs(filepath.Join(o.Paths.BatchDir(m.ID()), dataset.ChainsFile))
-			for _, id := range ids {
-				if err == nil {
-					err = b.AddChain(id)
-				}
-			}
-		}
-		if err == nil {
-			err = b.SetApplied(m.Log, m.CommitSeq)
-		}
-		if err == nil {
-			err = b.Commit()
-		}
-		b.Close()
-		if err != nil {
-			return fmt.Errorf("re-applying batch %s to the index: %w", m.BatchID, err)
+		if _, _, err := applyBatch(o.Index, reader, o, m); err != nil {
+			return err
 		}
 		applied[m.Log] = m.CommitSeq
 		r.Actions = append(r.Actions, "re-applied batch "+m.BatchID+" to the index")
 	}
 	return nil
+}
+
+// applied is what applyBatch wrote for one certificate.
+type applied struct {
+	sha [32]byte
+	ref index.Ref
+}
+
+// applyBatch writes a committed batch to the index in one Pebble batch: its
+// vault records' certificates, the chains of its chains.parquet, and its
+// commit_seq as the log's applied position. It is idempotent.
+func applyBatch(x *index.Index, reader *vault.Reader, o RecoverOptions, m Manifest) ([]applied, [][32]byte, error) {
+	var certs []applied
+	b := x.NewBatch()
+	defer b.Close()
+	err := vault.Scan(o.VaultDirs, m.Vault.Start, m.Vault.End, func(loc vault.Loc, rec vault.Record) error {
+		der, _, err := reader.Read(loc)
+		if err != nil {
+			return err
+		}
+		a := applied{sha: sha256.Sum256(der), ref: index.Ref{CertID: rec.CertID, Loc: loc}}
+		certs = append(certs, a)
+		return b.AddCert(a.sha, a.ref)
+	})
+	var chains [][32]byte
+	if err == nil {
+		chains, err = o.ChainIDs(filepath.Join(o.Paths.BatchDir(m.ID()), dataset.ChainsFile))
+		for _, id := range chains {
+			if err == nil {
+				err = b.AddChain(id)
+			}
+		}
+	}
+	if err == nil {
+		err = b.SetApplied(m.Log, m.CommitSeq)
+	}
+	if err == nil {
+		err = b.Commit()
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("applying batch %s to the index: %w", m.BatchID, err)
+	}
+	return certs, chains, nil
 }
 
 // removeInterruptedWrites deletes what a writer killed inside
@@ -289,6 +323,49 @@ func removeInterruptedWrites(o RecoverOptions, r *Recovered) error {
 				p = rel
 			}
 			r.Actions = append(r.Actions, "removed the leftover of an interrupted write: "+p)
+		}
+	}
+	return nil
+}
+
+// ReindexDir is where repair --reindex builds a new index beside
+// state/pebble (amendment A2 §5.6).
+const ReindexDir = "pebble.reindex"
+
+// derivedName matches a derived table's file name, <table>.p<version>.parquet.
+var derivedName = regexp.MustCompile(`^[a-z][a-z0-9_]*\.p[0-9]+\.parquet$`)
+
+// removeUnlistedDerived deletes, in committed batch directories, the derived
+// files neither _COMMIT.json nor _DERIVED.json lists, and the temp files of
+// an interrupted _DERIVED.json write: a rebuild killed after placing its
+// files and before its commit point leaves them. They are derived and
+// regenerable (amendment A2 §5.5). Other files are left alone.
+func removeUnlistedDerived(o RecoverOptions, committed []Manifest, r *Recovered) error {
+	for _, m := range committed {
+		dir := o.Paths.BatchDir(m.ID())
+		es, err := os.ReadDir(dir)
+		if err != nil {
+			return err
+		}
+		removed := false
+		for _, e := range es {
+			name := e.Name()
+			if _, listed := m.Listed(name); listed || !e.Type().IsRegular() {
+				continue
+			}
+			if !derivedName.MatchString(name) && !(fsutil.IsAtomicTemp(name) && strings.HasPrefix(name, "."+DerivedFile+".")) {
+				continue
+			}
+			if err := os.Remove(filepath.Join(dir, name)); err != nil {
+				return err
+			}
+			removed = true
+			r.Actions = append(r.Actions, "removed unlisted derived file "+m.BatchID+"/"+name)
+		}
+		if removed {
+			if err := fsutil.SyncDir(dir); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

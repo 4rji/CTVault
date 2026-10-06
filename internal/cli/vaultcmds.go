@@ -6,6 +6,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/4rji/ctvault/internal/config"
+	"github.com/4rji/ctvault/internal/derive"
 	"github.com/4rji/ctvault/internal/volume"
 )
 
@@ -25,6 +26,9 @@ func newInitCmd(a *app) *cobra.Command {
 				return volumeErr(err)
 			}
 			if err := writeConfig(args[0]); err != nil {
+				return err
+			}
+			if err := derive.WriteActive(args[0], derive.Complete()); err != nil {
 				return err
 			}
 			r := id.Volumes[0]

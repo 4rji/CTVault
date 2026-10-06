@@ -1,0 +1,30 @@
+query: example.test
+ names  certs [issuances] · sort first_seen desc
+Keys (? or Esc closes this)
+
+  enter              run the query; open a name's certs or a cert
+  tab                names, certs, issuances
+  esc                cancel; close; edit the query
+  ↑↓ pgup pgdn g G   move
+  f                  certificate: detail, text, PEM
+  w                  write the shown certificate
+  space              mark a row
+  e                  export the marked rows, or all
+  /                  filter the whole result
+  s                  sort: next column and direction
+  R                  re-pin to the latest commit
+  ?                  help
+  q ctrl+c           quit
+
+The bar: a domain, or suffix:, exact:, ip:, contains: or regex:, then filters:
+  issuer: org: issued-by: key: kind: status: valid-at: wildcard log: since: until: by:not-before
+  Values with spaces go in double quotes: issuer:"Let's Encrypt"
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+30 issuances · 42 ms · certs v1 ✓ · names v1 ✓ · as-of commit 3                              [?]help
