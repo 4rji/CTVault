@@ -463,4 +463,6 @@ The other physical checks also wait for the drive. None of them blocks Plan 2:
 5. Real disk-cap behaviour on the 4 TB drive (statfs, ext4 reserved blocks,
    projections).
 6. Enclosure throughput and fsync latency.
-7. The `dm-log-writes` power-loss gate on ext4 (Plan 6).
+
+The `dm-log-writes` power-loss gate (Plan 6C) has passed on ext4 on a loop
+image (977 crash points, 0 failed); it does not need the drive.
