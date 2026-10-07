@@ -254,8 +254,8 @@ data nor rewrites a manifest.
 
 Log names are the conventional names from the log list, lowercased:
 `argon2027h1`, `wyvern2027h1`, `oak2026h2`, `mammoth2026h2` and so on.
-`logs list --available` shows them. Tiled (static-ct-api) logs are listed in
-Chrome's log list but cannot be pinned in v1.
+`logs list --available` shows them, with their kind. Tiled (static-ct-api)
+logs such as `parcelyard2027h1` are pinned with `logs add` like RFC 6962 ones.
 
 The vault must be a dedicated volume. `init` refuses the system disk, including
 a loop image, LVM or LUKS device stored on it, as well as any disk that already
