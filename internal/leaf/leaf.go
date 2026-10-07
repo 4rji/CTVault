@@ -59,12 +59,15 @@ const (
 	IssuerKeyHashMismatch  Code = "issuer_key_hash_mismatch"
 	PrecertTBSMismatch     Code = "precert_tbs_mismatch"
 	IssuanceKeyUnavailable Code = "issuance_key_unavailable"
+
+	// Tiled (static-ct-api) logs only (amendment A6 §3.2).
+	LeafIndexMismatch Code = "leaf_index_mismatch"
 )
 
 // Codes lists every code in a fixed order, for docs and explain-error.
 var Codes = []Code{BadVersion, BadLeafType, UnknownEntryType, Truncated, TrailingBytes,
 	ExtraTruncated, ExtraTrailingBytes, ChainCertEmpty, ChainIssuerMissing, ChainIssuerAmbiguous,
-	IssuerKeyHashMismatch, PrecertTBSMismatch, IssuanceKeyUnavailable}
+	IssuerKeyHashMismatch, PrecertTBSMismatch, IssuanceKeyUnavailable, LeafIndexMismatch}
 
 var explanations = map[Code]string{
 	BadVersion:       "The MerkleTreeLeaf version is not v1 (0). The entry is kept in entries with its leaf hash, but no certificate can be read from it.",
@@ -83,6 +86,8 @@ var explanations = map[Code]string{
 	IssuerKeyHashMismatch:  "The precert entry's issuer_key_hash differs from the SHA-256 of the issuer's SubjectPublicKeyInfo.",
 	PrecertTBSMismatch:     "The precert entry's TBSCertificate differs from the precertificate's with the poison removed (and the issuer replaced when a precert-signing certificate is used).",
 	IssuanceKeyUnavailable: "The issuance key (which links a precert to its final certificate) cannot be computed for this entry.",
+
+	LeafIndexMismatch: "A tiled (static-ct-api) log entry's leaf_index extension is missing, malformed, duplicated or differs from the entry's position. The certificate is kept.",
 }
 
 // Explain returns the code's explanation for explain-error, or "" for OK
@@ -306,4 +311,43 @@ func (e *Entry) x509IssuanceDigest() {
 		return
 	}
 	e.IssuanceDigest, e.HasIssuanceDigest = sha256.Sum256(tbs), true
+}
+
+// CheckLeafIndex checks a tiled log entry's CtExtensions: static-ct-api
+// requires exactly one leaf_index extension (type 0, a 40-bit big-endian
+// index) equal to the entry's position, and no extension type twice. Any
+// other content records LeafIndexMismatch, unless the entry already has a
+// code (amendment A6 §3.2). RFC 6962 entries are never checked.
+func CheckLeafIndex(e *Entry, extensions []byte, index uint64) {
+	s := cryptobyte.String(extensions)
+	seen := map[uint8]bool{}
+	found := false
+	for !s.Empty() {
+		var typ uint8
+		var data cryptobyte.String
+		if !s.ReadUint8(&typ) || !s.ReadUint16LengthPrefixed(&data) || seen[typ] {
+			e.fail(LeafIndexMismatch)
+			return
+		}
+		seen[typ] = true
+		if typ != 0 {
+			continue
+		}
+		if len(data) != 5 {
+			e.fail(LeafIndexMismatch)
+			return
+		}
+		var v uint64
+		for _, c := range data {
+			v = v<<8 | uint64(c)
+		}
+		if v != index {
+			e.fail(LeafIndexMismatch)
+			return
+		}
+		found = true
+	}
+	if !found {
+		e.fail(LeafIndexMismatch)
+	}
 }

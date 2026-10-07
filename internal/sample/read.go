@@ -2,6 +2,7 @@ package sample
 
 import (
 	"bufio"
+	"context"
 	"crypto"
 	"encoding/base64"
 	"encoding/json"
@@ -37,6 +38,7 @@ type Sample struct {
 	Head     merkle.SignedTreeHead
 	Proofs   Proofs
 	pub      crypto.PublicKey
+	start    *merkle.State // tiled samples: the verified compact range at Start
 }
 
 // Open loads and fully verifies the sample in dir (amendment A1 §2.4):
@@ -48,11 +50,19 @@ func Open(dir string) (*Sample, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := s.verifyMerkle(); err != nil {
+	if s.Tiled() {
+		err = s.verifyTiled(context.Background())
+	} else {
+		err = s.verifyMerkle()
+	}
+	if err != nil {
 		return nil, err
 	}
 	return s, nil
 }
+
+// Tiled reports whether the sample mirrors a tiled log (amendment A6 §5).
+func (s *Sample) Tiled() bool { return s.Manifest.Protocol == ProtocolTiled }
 
 func corrupt(format string, args ...any) error {
 	return fmt.Errorf("%w: %s", ErrCorrupt, fmt.Sprintf(format, args...))
@@ -70,6 +80,16 @@ func load(dir string) (*Sample, error) {
 	m := s.Manifest
 	if m.Format != Format {
 		return nil, corrupt("unsupported format %d", m.Format)
+	}
+	switch m.Protocol {
+	case ProtocolTiled:
+		if err := loadTiled(dir, s); err != nil {
+			return nil, err
+		}
+		return s, nil
+	case "":
+	default:
+		return nil, corrupt("unknown protocol %q", m.Protocol)
 	}
 	lim := Limits{Boundary: m.Boundary, Min: 1, Max: ^uint64(0)}
 	if m.Boundary == 0 || lim.Check(m.Kind, m.Start, m.Count) != nil || uint64(len(m.Frames)) != m.Count/m.Boundary {
@@ -166,6 +186,9 @@ func (s *Sample) Frame(k int) ([]Entry, error) {
 
 // Each calls fn for every entry in index order.
 func (s *Sample) Each(fn func(Entry) error) error {
+	if s.Tiled() {
+		return s.eachTiled(fn)
+	}
 	for k := range s.Manifest.Frames {
 		entries, err := s.Frame(k)
 		if err != nil {
@@ -211,6 +234,12 @@ func (s *Sample) StartState() (*merkle.State, error) {
 	if m.Kind == Canonical {
 		return merkle.NewState(), nil
 	}
+	if s.Tiled() { // read from hash tiles and verified by Open (amendment A6 §5)
+		if s.start == nil {
+			return nil, corrupt("the start state was not verified")
+		}
+		return s.start.Clone(), nil
+	}
 	inc := s.Proofs.Inclusion
 	if inc == nil || inc.LeafIndex != m.Start || inc.TreeSize != s.Head.TreeSize {
 		return nil, corrupt("representative sample lacks the inclusion proof of leaf %d", m.Start)
@@ -252,7 +281,17 @@ func (s *Sample) verifyMerkle() error {
 
 // LogInfo returns the sampled log with its pinned key, served at url.
 func (s *Sample) LogInfo(url string) logsource.LogInfo {
-	return logsource.LogInfo{Name: s.Manifest.Log.Name, LogID: s.LogIDBytes(), PublicKey: s.pub, URL: url}
+	info := logsource.LogInfo{Name: s.Manifest.Log.Name, Kind: loglist.KindRFC6962, LogID: s.LogIDBytes(), PublicKey: s.pub, URL: url}
+	if s.Tiled() {
+		info.Kind, info.Origin = loglist.KindTiled, s.Manifest.Log.Origin
+	}
+	return info
+}
+
+// SignedHead is the sample's pinned head with its raw bytes, as a source
+// that never fetched it accepts it.
+func (s *Sample) SignedHead() logsource.SignedHead {
+	return logsource.SignedHead{SignedTreeHead: s.Head, Raw: s.Manifest.HeadRaw}
 }
 
 // LogIDBytes returns the sampled log's ID.

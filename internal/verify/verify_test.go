@@ -362,3 +362,24 @@ func TestReportJSON(t *testing.T) {
 	}
 	r.WriteText(io.Discard)
 }
+
+// TestAbandonedIntent: recovery keeps an uncommitted batch's intent marked
+// abandoned, for the next update to fetch the batch again: that is the
+// recovered state, not recovery pending (found by the power-loss gate).
+func TestAbandonedIntent(t *testing.T) {
+	root := fresh(t, template(t))
+	ms, err := commit.ListCommitted(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := ms[len(ms)-1]
+	next := commit.BatchID{Log: "fakelog", First: last.Last + 1, Last: last.Last + 20}
+	in := commit.Intent{BatchID: next.String(), Log: next.Log, First: next.First, Last: next.Last, VaultTail: last.Vault.End,
+		NextCertID: last.NextCertID, MerkleBefore: last.MerkleAfter, StartedAt: time.Unix(1, 0).UTC(), Abandoned: true}
+	if err := commit.WriteIntent(commit.Paths{Root: root}, in, nil); err != nil {
+		t.Fatal(err)
+	}
+	if r := run(t, options(root)); r.Damaged() || len(r.Pending) != 0 {
+		t.Fatalf("an abandoned intent:\n%s", text(r))
+	}
+}

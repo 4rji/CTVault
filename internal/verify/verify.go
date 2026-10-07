@@ -582,9 +582,14 @@ func (v *verifier) pending() error {
 		return err
 	}
 	for _, in := range intents {
-		if _, err := os.Stat(filepath.Join(v.p.BatchDir(in.ID()), commit.ManifestFile)); err == nil {
+		_, err := os.Stat(filepath.Join(v.p.BatchDir(in.ID()), commit.ManifestFile))
+		switch {
+		case err == nil:
 			v.rep.Pending = append(v.rep.Pending, "batch "+in.BatchID+" committed, and its intent remains")
-		} else {
+		case in.Abandoned:
+			// Recovery already gave the attempt up; the next update fetches
+			// the batch again. That is the recovered state.
+		default:
 			v.rep.Pending = append(v.rep.Pending, "an intent for batch "+in.BatchID+": a writer stopped before committing it")
 		}
 	}

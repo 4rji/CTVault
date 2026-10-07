@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/4rji/ctvault/internal/ctlogtest"
+	"github.com/4rji/ctvault/internal/logsource"
 	"github.com/4rji/ctvault/internal/merkle"
 )
 
@@ -86,6 +87,12 @@ func TestRateLimitIsReported(t *testing.T) {
 	if !errors.As(err, &he) || he.RetryAfter != time.Second {
 		t.Fatalf("Retry-After not parsed: %+v", he)
 	}
+	// The error types are logsource's, shared with the tiled source, so the
+	// fetcher classifies both alike (amendment A6 §2.1).
+	var shared *logsource.HTTPError
+	if !errors.Is(err, logsource.ErrRateLimited) || !errors.As(err, &shared) || shared.Status != http.StatusTooManyRequests {
+		t.Fatalf("not a logsource.HTTPError: %v", err)
+	}
 }
 
 func TestMalformedResponses(t *testing.T) {
@@ -97,7 +104,7 @@ func TestMalformedResponses(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(body)) }))
 		_, err := New(srv.URL, nil).GetSTH(ctx)
 		srv.Close()
-		if !errors.Is(err, ErrMalformed) {
+		if !errors.Is(err, ErrMalformed) || !errors.Is(err, logsource.ErrMalformed) {
 			t.Errorf("%s: want ErrMalformed, got %v", name, err)
 		}
 	}

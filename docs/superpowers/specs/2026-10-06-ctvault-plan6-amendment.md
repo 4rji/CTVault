@@ -4,7 +4,7 @@
 - **Status:**
   - Part 6A approved 2026-10-06, section by section and then as written ("ok"); built in the tree the same day (summary: `docs/superpowers/plans/2026-10-06-ctvault-plan-6a-verify-repair-summary.md`).
   - Part 6B (§7–§12) approved 2026-10-06 section by section and then as written ("ok"); built in the tree the same day (summary: `docs/superpowers/plans/2026-10-06-ctvault-plan-6b-transitions-summary.md`).
-  - Part 6C (§13–§17) approved 2026-10-06 section by section and then as written ("sigue").
+  - Part 6C (§13–§17) approved 2026-10-06 section by section and then as written ("sigue"); built in the tree, and the user's full privileged run passed the same day (summary: `docs/superpowers/plans/2026-10-06-ctvault-plan-6c-powerloss-summary.md`).
 - **Amends:** `docs/superpowers/specs/2026-10-04-ctvault-design.md` §7.5, §7.6, §7.8, §8.5, §8.7, §10.1, §11, §13 and §14 ("the spec"), and amendments A1–A4.
 - **Origin:** Plan 6 design discussion.
   - Plan 6 is phase 6 of spec §16, chosen before tiled logs (choice A).

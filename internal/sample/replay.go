@@ -113,6 +113,9 @@ func (rp *Replay) entry(i uint64) (Entry, error) {
 // Serve listens on 127.0.0.1 and serves the sample until ctx ends. It
 // returns the log URL (ending in "/") and a function that stops the server.
 func Serve(ctx context.Context, s *Sample) (string, func(), error) {
+	if s.Tiled() {
+		return serveTiled(ctx, s)
+	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return "", nil, err

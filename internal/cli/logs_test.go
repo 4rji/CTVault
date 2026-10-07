@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -24,6 +25,12 @@ func TestLogsAddListInfo(t *testing.T) {
 	out = e.mustRun("--root", e.root, "logs", "list", "--available")
 	if !strings.Contains(out, "xenon2027h1") || !strings.Contains(out, "yes") {
 		t.Fatalf("logs list --available output: %s", out)
+	}
+	// Both kinds are listed, with a KIND column (amendment A6 §1).
+	if !regexp.MustCompile(`(?m)^parcelyard2027h1\s+tiled\s+usable\s+Google\s+https://storage\.googleapis\.com/parcelyard2027h1`).MatchString(out) ||
+		!regexp.MustCompile(`(?m)^argon2027h1\s+rfc6962\s+usable\s+Google\s+yes\s+https://ct\.googleapis\.com/`).MatchString(out) ||
+		!strings.HasPrefix(out, "NAME") || !strings.Contains(strings.SplitN(out, "\n", 2)[0], "KIND") {
+		t.Fatalf("logs list --available must show both kinds:\n%s", out)
 	}
 	out = e.mustRun("--root", e.root, "logs", "info", "argon2027h1")
 	if !strings.Contains(out, "tree_size  384065451") || !strings.Contains(out, "verified with pinned key") {
@@ -66,13 +73,35 @@ func TestLogsInfoRejectsForgedHead(t *testing.T) {
 	}
 }
 
+// TestLogsAddTiled: a tiled log is pinned with its kind, monitoring prefix
+// and origin, and shown by list and info (amendment A6 §1).
+func TestLogsAddTiled(t *testing.T) {
+	e := newEnv(t, realSTH(t))
+	e.mustRun("init", e.root)
+	out := e.mustRun("--root", e.root, "logs", "add", "parcelyard2027h1")
+	for _, want := range []string{"Pinned parcelyard2027h1", "kind    tiled (static-ct-api)",
+		"url     https://storage.googleapis.com/parcelyard2027h1.prod.certificate.transparency.goog/ (monitoring)",
+		"origin  parcelyard2027h1.prod.certificate.transparency.goog"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("logs add output lacks %q:\n%s", want, out)
+		}
+	}
+	out = e.mustRun("--root", e.root, "logs", "list")
+	if !strings.Contains(strings.SplitN(out, "\n", 2)[0], "KIND") || !regexp.MustCompile(`(?m)^parcelyard2027h1\s+tiled\s+usable`).MatchString(out) {
+		t.Fatalf("logs list output:\n%s", out)
+	}
+	out = e.mustRun("--root", e.root, "logs", "info", "--offline", "parcelyard2027h1")
+	for _, want := range []string{"kind       tiled", "origin     parcelyard2027h1.prod.certificate.transparency.goog",
+		"submission https://parcelyard2027h1.prod.certificate.transparency.goog/"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("logs info output lacks %q:\n%s", want, out)
+		}
+	}
+}
+
 func TestLogsAddFailures(t *testing.T) {
 	e := newEnv(t, realSTH(t))
 	e.mustRun("init", e.root)
-	if got := e.run("--root", e.root, "logs", "add", "parcelyard2027h1"); got != exitcode.Error ||
-		!strings.Contains(e.stderr.String(), "tiled") {
-		t.Fatalf("tiled log: exit %d stderr %s", got, e.stderr)
-	}
 	held, err := lock.Acquire(filepath.Join(e.root, "state", "LOCK"))
 	if err != nil {
 		t.Fatal(err)

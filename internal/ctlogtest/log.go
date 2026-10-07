@@ -7,7 +7,6 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -38,6 +37,23 @@ type Options struct {
 	// duration before any lock is taken, so concurrent requests can complete
 	// out of order. It receives the requested start index.
 	EntriesDelay func(start uint64) time.Duration
+
+	// Tiled also serves the static-ct-api read path from the same tree
+	// (amendment A6 §7): every entry then carries a leaf_index extension, in
+	// both protocols. The fields below apply to it.
+	Tiled            bool
+	Origin           string   // the checkpoint origin; DefaultOrigin if empty
+	CheckpointFault  string   // WrongOrigin, ExtensionLine, TwoKeyLines or NoKeyLine
+	BadLeafIndex     []uint64 // these entries carry leaf_index = index+1
+	NoLeafIndex      []uint64 // these entries carry no extension
+	KeepPartials     bool     // keep partial tiles after the full tile exists
+	CutDataTileEvery int      // a data tile is sent cut in half
+	BadHashTile      bool     // every hash tile has one byte flipped
+	IssuerWrongBytes bool     // issuers are served with a byte appended
+	RedirectTiles    bool     // tile requests answer 302
+	GzipData         bool     // data tiles are sent with Content-Encoding: gzip
+	// Missing, if set, makes the paths it matches (tiles, issuers) answer 404.
+	Missing func(path string) bool
 }
 
 // Log is a running fake log.
@@ -46,6 +62,7 @@ type Log struct {
 	PublicKeyDER []byte // SPKI, as the log list publishes it
 	LogID        [32]byte
 	Entries      []Entry
+	Origin       string // the checkpoint origin (Options.Tiled)
 
 	t    testing.TB
 	key  *ecdsa.PrivateKey
@@ -59,6 +76,9 @@ type Log struct {
 	counts    map[string]int
 	altered   map[uint64]bool
 	byHash    map[[32]byte]uint64 // leaf hash → first index, for get-proof-by-hash
+
+	checkpoints map[uint64]bool     // sizes a checkpoint was produced at (Tiled)
+	issuers     map[[32]byte][]byte // chain certificates by SHA-256 (Tiled)
 }
 
 // New starts a fake log holding n generated entries, all published.
@@ -81,6 +101,16 @@ func NewWithEntries(t testing.TB, entries []Entry, opts Options) *Log {
 	if opts.PageSize == 0 {
 		opts.PageSize = 32
 	}
+	if opts.Tiled {
+		set := func(xs []uint64) map[uint64]bool {
+			m := map[uint64]bool{}
+			for _, x := range xs {
+				m[x] = true
+			}
+			return m
+		}
+		entries = withLeafIndex(entries, set(opts.BadLeafIndex), set(opts.NoLeafIndex))
+	}
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -91,7 +121,8 @@ func NewWithEntries(t testing.TB, entries []Entry, opts Options) *Log {
 	}
 	l := &Log{PublicKeyDER: spki, LogID: sha256.Sum256(spki), Entries: entries, t: t, key: key, opts: opts,
 		honest: testonly.New(rfc6962.DefaultHasher), published: uint64(len(entries)),
-		counts: map[string]int{}, altered: map[uint64]bool{}, byHash: map[[32]byte]uint64{}}
+		counts: map[string]int{}, altered: map[uint64]bool{}, byHash: map[[32]byte]uint64{},
+		checkpoints: map[uint64]bool{uint64(len(entries)): true}, issuers: map[[32]byte][]byte{}}
 	for i, e := range entries {
 		l.honest.AppendData(e.LeafInput)
 		var h [32]byte
@@ -109,6 +140,24 @@ func NewWithEntries(t testing.TB, entries []Entry, opts Options) *Log {
 	mux.HandleFunc("GET /ct/v1/get-sth-consistency", l.getConsistency)
 	mux.HandleFunc("GET /ct/v1/get-entries", l.getEntries)
 	mux.HandleFunc("GET /ct/v1/get-proof-by-hash", l.getProofByHash)
+	if opts.Tiled {
+		l.Origin = opts.Origin
+		if l.Origin == "" {
+			l.Origin = DefaultOrigin
+		}
+		for _, e := range entries {
+			_, chain, ok := splitExtra(e)
+			if !ok {
+				t.Fatalf("ctlogtest: an entry's extra_data cannot be tiled")
+			}
+			for _, c := range chain {
+				l.issuers[sha256.Sum256(c)] = c
+			}
+		}
+		mux.HandleFunc("GET /checkpoint", l.serveCheckpoint)
+		mux.HandleFunc("GET /tile/", l.serveTile)
+		mux.HandleFunc("GET /issuer/", l.serveIssuer)
+	}
 	l.srv = httptest.NewServer(mux)
 	t.Cleanup(l.srv.Close)
 	l.URL = l.srv.URL + "/"
@@ -124,6 +173,7 @@ func (l *Log) Publish(size uint64) {
 		size = uint64(len(l.Entries))
 	}
 	l.published = size
+	l.checkpoints[size] = true
 }
 
 // Fork makes STHs and proofs come from a tree whose leaf at index differs:
@@ -201,24 +251,12 @@ func (l *Log) getSTH(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	size := l.published
-	ts := uint64(1790000000000) + size
-	root := l.rootAt(size)
-	in := []byte{0, 1}
-	in = binary.BigEndian.AppendUint64(in, ts)
-	in = binary.BigEndian.AppendUint64(in, size)
-	in = append(in, root...)
-	digest := sha256.Sum256(in)
-	sig, err := ecdsa.SignASN1(rand.Reader, l.key, digest[:])
+	ts, ds, err := l.treeHeadSignature(size)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if l.opts.BadSTHSignature {
-		sig[len(sig)-1] ^= 0xff
-	}
-	ds := []byte{4, 3}
-	ds = binary.BigEndian.AppendUint16(ds, uint16(len(sig)))
-	ds = append(ds, sig...)
+	root := l.rootAt(size)
 	writeJSON(w, map[string]any{
 		"tree_size": size, "timestamp": ts,
 		"sha256_root_hash":    base64.StdEncoding.EncodeToString(root),

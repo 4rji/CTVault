@@ -116,3 +116,39 @@ func TestZeroStateDoesNotPanic(t *testing.T) {
 		t.Fatalf("empty root: %v", err)
 	}
 }
+
+// TestStateFromNodes: the compact range's nodes, as read from tiles, give
+// the state appending would build, and continue to the same root; a list of
+// the wrong length is refused (amendment A6 §5).
+func TestStateFromNodes(t *testing.T) {
+	tree := testonly.New(rfc6962.DefaultHasher)
+	var leaves [][32]byte
+	for size := uint64(0); size <= 70; size++ {
+		want := NewState()
+		for _, h := range leaves {
+			want.Append(h)
+		}
+		raw := want.r.Hashes()
+		nodes := make([][32]byte, len(raw))
+		for i := range raw {
+			copy(nodes[i][:], raw[i])
+		}
+		got, err := StateFromNodes(size, nodes)
+		if err != nil {
+			t.Fatalf("size %d: %v", size, err)
+		}
+		gr, _ := got.Root()
+		wr, _ := want.Root()
+		if got.Size() != size || gr != wr {
+			t.Fatalf("size %d: state from nodes differs", size)
+		}
+		if size > 0 {
+			if _, err := StateFromNodes(size, append(nodes, nodes[0])); err == nil {
+				t.Fatalf("size %d: an extra node was accepted", size)
+			}
+		}
+		data := []byte{byte(size), 9}
+		tree.AppendData(data)
+		leaves = append(leaves, LeafHash(data))
+	}
+}

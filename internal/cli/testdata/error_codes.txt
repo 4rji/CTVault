@@ -41,3 +41,4 @@ extract aki_unreadable
 extract ski_unreadable
 extract signature_unreadable
 extract tbs_extra_fields
+leaf leaf_index_mismatch

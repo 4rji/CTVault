@@ -348,8 +348,12 @@ func (b *batch) add(e logsource.RawEntry) error {
 	if e.Leaf.Code != leaf.OK {
 		row.LeafError = string(e.Leaf.Code)
 		b.counts.LeafErrors++
-		line, _ := json.Marshal(map[string]any{"idx": e.Index, "leaf_error": e.Leaf.Code,
-			"leaf_input": base64.StdEncoding.EncodeToString(e.LeafInput), "extra_data": base64.StdEncoding.EncodeToString(e.ExtraData)})
+		q := map[string]any{"idx": e.Index, "leaf_error": e.Leaf.Code,
+			"leaf_input": base64.StdEncoding.EncodeToString(e.LeafInput), "extra_data": base64.StdEncoding.EncodeToString(e.ExtraData)}
+		if e.TileLeaf != nil { // a tiled log's entry exactly as served (amendment A6 §3)
+			q["tile_leaf"] = base64.StdEncoding.EncodeToString(e.TileLeaf)
+		}
+		line, _ := json.Marshal(q)
 		b.quar.Write(append(line, '\n'))
 	}
 	if e.Leaf.CertDER != nil {

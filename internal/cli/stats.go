@@ -74,7 +74,7 @@ func statsInput(a *app, root string, dirs []string, cfg config.Config) (stats.In
 		if err != nil {
 			return in, exitcode.With(exitcode.Verification, err)
 		}
-		l := stats.LogInput{Name: rec.Name, State: rec.State, PinnedAt: rec.PinnedAt}
+		l := stats.LogInput{Name: rec.Name, Kind: rec.LogKind(), State: rec.State, PinnedAt: rec.PinnedAt}
 		if head != nil {
 			l.Head = &stats.Head{TreeSize: head.TreeSize, Timestamp: time.UnixMilli(int64(head.Timestamp)).UTC()}
 		}

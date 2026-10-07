@@ -303,7 +303,7 @@ func TestPowerLoss(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := &runner{t: t, base: base, name: dmName(os.Getpid()),
-		rep: report{Started: time.Now().UTC(), Every: *every, Phases: map[string]*phaseCount{}}}
+		rep: report{Started: time.Now().UTC(), Every: *every, Phases: map[string]*phaseCount{}, Failures: []failure{}}}
 	r.rep.Kernel = strings.TrimSpace(func() string {
 		var u unix.Utsname
 		unix.Uname(&u)

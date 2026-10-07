@@ -8,18 +8,18 @@ import (
 	"net"
 	"time"
 
-	"github.com/4rji/ctvault/internal/logsource/rfc6962"
+	"github.com/4rji/ctvault/internal/logsource"
 )
 
 // Transient reports whether err is worth retrying: HTTP 429 or 5xx, a
 // malformed response, or a network error.
 func Transient(err error) bool {
-	var he *rfc6962.HTTPError
+	var he *logsource.HTTPError
 	var ne net.Error
 	switch {
 	case errors.As(err, &he):
 		return he.Status == 429 || he.Status >= 500
-	case errors.Is(err, rfc6962.ErrMalformed), errors.As(err, &ne):
+	case errors.Is(err, logsource.ErrMalformed), errors.As(err, &ne):
 		return true
 	}
 	return false
@@ -41,7 +41,7 @@ func Retry(ctx context.Context, o Options, fn func(context.Context) error) error
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		var he *rfc6962.HTTPError
+		var he *logsource.HTTPError
 		other := errors.As(err, &he) && !Transient(err)
 		if (!Transient(err) && !other) || (other && attempt > maxOtherRetries) {
 			return err

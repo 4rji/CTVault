@@ -12,7 +12,7 @@ import (
 	"github.com/4rji/ctvault/internal/config"
 	"github.com/4rji/ctvault/internal/exitcode"
 	"github.com/4rji/ctvault/internal/logsource"
-	"github.com/4rji/ctvault/internal/logsource/rfc6962"
+	"github.com/4rji/ctvault/internal/logsource/sources"
 	"github.com/4rji/ctvault/internal/sample"
 )
 
@@ -52,13 +52,18 @@ func addReplay(cmd *cobra.Command, u *updateRun) {
 		} else if u.logName != m.Log.Name {
 			return exitcode.Withf(exitcode.Usage, "the sample is of log %s, not %s", m.Log.Name, u.logName)
 		}
-		if u.untilSet && (u.until%m.Boundary != 0 || u.until > m.Start+m.Count) {
+		if u.untilSet && u.until > m.Start+m.Count {
+			return exitcode.Withf(exitcode.Usage, "with --replay, --until must be within the sample's %d entries", m.Count)
+		}
+		// A tiled sample holds the tiles of a proof from any position in it
+		// (amendment A6 §5); an RFC 6962 sample only its boundaries'.
+		if u.untilSet && !s.Tiled() && u.until%m.Boundary != 0 {
 			return exitcode.Withf(exitcode.Usage, "with --replay, --until must be a multiple of %d within the sample's %d entries", m.Boundary, m.Count)
 		}
 		return nil
 	}
 	u.check = func(cfg config.Config, next uint64) error {
-		if s == nil {
+		if s == nil || s.Tiled() {
 			return nil
 		}
 		b := s.Manifest.Boundary
@@ -74,12 +79,20 @@ func addReplay(cmd *cobra.Command, u *updateRun) {
 		if s.LogIDBytes() != info.LogID {
 			return nil, 0, nil, exitcode.Withf(exitcode.Usage, "the sample's log ID differs from the pinned log %s", info.Name)
 		}
+		if si := s.LogInfo(""); si.Kind != info.Kind || si.Origin != info.Origin {
+			return nil, 0, nil, exitcode.Withf(exitcode.Usage, "the sample is of a %s log (origin %q), but %s is pinned as %s (origin %q)",
+				si.Kind, si.Origin, info.Name, info.Kind, info.Origin)
+		}
 		url, stopFn, err := sample.Serve(c.Context(), s)
 		if err != nil {
 			return nil, 0, nil, err
 		}
 		info.URL = url
-		src := rfc6962.NewSource(info, &http.Client{Timeout: 60 * time.Second}, chains, last)
+		src, err := sources.Open(info, &http.Client{Timeout: 60 * time.Second}, chains, last)
+		if err != nil {
+			stopFn()
+			return nil, 0, nil, err
+		}
 		return src, s.Manifest.Start + s.Manifest.Count, stopFn, nil
 	}
 }

@@ -130,12 +130,9 @@ func TestReindexMemoryStaysFlat(t *testing.T) {
 		_, state, tail = e.batch(i*size, size, ids, i+1, state, tail, "done")
 	}
 	e.certs = nil // the fixture's own data is not the reindex's
-	heap := func() int64 {
-		var ms runtime.MemStats
-		runtime.GC()
-		runtime.ReadMemStats(&ms)
-		return int64(ms.HeapAlloc)
-	}
+	defer func(rate int) { runtime.MemProfileRate = rate }(runtime.MemProfileRate)
+	runtime.MemProfileRate = 1 // every allocation, so heapOutsidePebble is exact
+	heap := heapOutsidePebble
 	var built, checked [2]int64
 	e.idx.Close()
 	_, err := Reindex(ReindexOptions{Paths: e.p, VaultDirs: e.dirs, Codec: e.codec, ChainIDs: e.stager.ChainIDs,
@@ -166,6 +163,48 @@ func TestReindexMemoryStaysFlat(t *testing.T) {
 	}{{"building", built}, {"checking", checked}} {
 		if per := (p.at[1] - p.at[0]) / ((batches - 1) * size); p.at[0] == 0 || per > 20 {
 			t.Fatalf("%s the index keeps %d bytes of Go heap per certificate (%d → %d)", p.what, per, p.at[0], p.at[1])
+		}
+	}
+}
+
+// heapOutsidePebble is the Go heap in use by everything but Pebble: what
+// this test bounds is CTVault's own retention per certificate (amendment
+// A5 §3.1), and Pebble's state is bounded by its configuration instead. Two
+// things made the plain HeapAlloc fail at random under -race (A6 gate,
+// 2026-10-07): Pebble's race builds put its memtable arenas on the Go heap
+// in half of all processes, by a coin flip at init
+// (internal/manual.useGoAllocation), and a memtable and WAL rotation can
+// land inside the measured window. It needs runtime.MemProfileRate = 1 from
+// before the allocations measured.
+func heapOutsidePebble() int64 {
+	runtime.GC()
+	runtime.GC() // the profile is complete only a cycle later
+	var recs []runtime.MemProfileRecord
+	for n := 1024; ; n *= 2 {
+		recs = make([]runtime.MemProfileRecord, n)
+		if k, ok := runtime.MemProfile(recs, true); ok {
+			recs = recs[:k]
+			break
+		}
+	}
+	var total int64
+	for _, r := range recs {
+		if !inPebble(r.Stack()) {
+			total += r.InUseBytes()
+		}
+	}
+	return total
+}
+
+func inPebble(stack []uintptr) bool {
+	frames := runtime.CallersFrames(stack)
+	for {
+		f, more := frames.Next()
+		if strings.HasPrefix(f.Function, "github.com/cockroachdb/pebble/") {
+			return true
+		}
+		if !more {
+			return false
 		}
 	}
 }

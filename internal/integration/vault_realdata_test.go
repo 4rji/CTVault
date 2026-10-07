@@ -31,7 +31,7 @@ import (
 	"github.com/4rji/ctvault/internal/ingest"
 	"github.com/4rji/ctvault/internal/leaf"
 	"github.com/4rji/ctvault/internal/logsource"
-	"github.com/4rji/ctvault/internal/logsource/rfc6962"
+	"github.com/4rji/ctvault/internal/logsource/sources"
 	"github.com/4rji/ctvault/internal/measure"
 	"github.com/4rji/ctvault/internal/sample"
 	"github.com/4rji/ctvault/internal/sampletest"
@@ -46,7 +46,7 @@ type realVault struct {
 	s      *sample.Sample
 	v      vaulttest.Vault
 	opts   ingest.Options
-	src    *rfc6962.Source
+	src    logsource.LogSource
 	chains *logsource.ChainCache
 	head   logsource.SignedHead
 	out    bytes.Buffer
@@ -69,7 +69,10 @@ func newRealVault(t *testing.T, s *sample.Sample, dictSamples int) *realVault {
 	}
 	t.Cleanup(stop)
 	r.chains = logsource.NewChainCache(logsource.DefaultChainCacheBytes)
-	r.src = rfc6962.NewSource(s.LogInfo(url), nil, r.chains, nil)
+	// The RFC 6962 or the tiled source, by the sample's protocol (A6 §5).
+	if r.src, err = sources.Open(s.LogInfo(url), nil, r.chains, nil); err != nil {
+		t.Fatal(err)
+	}
 	if r.head, err = r.src.Head(context.Background()); err != nil {
 		t.Fatal(err)
 	}

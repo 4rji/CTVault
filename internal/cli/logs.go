@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"text/tabwriter"
 	"time"
@@ -10,7 +11,8 @@ import (
 	"github.com/4rji/ctvault/internal/exitcode"
 	"github.com/4rji/ctvault/internal/loglist"
 	"github.com/4rji/ctvault/internal/logreg"
-	"github.com/4rji/ctvault/internal/logsource/rfc6962"
+	"github.com/4rji/ctvault/internal/logsource"
+	"github.com/4rji/ctvault/internal/logsource/sources"
 	"github.com/4rji/ctvault/internal/merkle"
 )
 
@@ -26,7 +28,7 @@ func logsListCmd(a *app, src *string) *cobra.Command {
 	var available bool
 	cmd := &cobra.Command{
 		Use:   "list",
-		Short: "List pinned logs, or all RFC 6962 logs in the log list with --available",
+		Short: "List pinned logs, or every log in the log list with --available",
 		Args:  usageArgs(cobra.NoArgs),
 		RunE: func(c *cobra.Command, _ []string) error {
 			root, _, err := a.openVault(c)
@@ -40,9 +42,9 @@ func logsListCmd(a *app, src *string) *cobra.Command {
 			tw := tabwriter.NewWriter(c.OutOrStdout(), 0, 4, 2, ' ', 0)
 			defer tw.Flush()
 			if !available {
-				fmt.Fprintln(tw, "NAME\tSTATE AT PIN\tPINNED AT\tURL")
+				fmt.Fprintln(tw, "NAME\tKIND\tSTATE AT PIN\tPINNED AT\tURL")
 				for _, r := range pinned {
-					fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", r.Name, r.State, r.PinnedAt.Format(time.RFC3339), r.URL)
+					fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", r.Name, r.LogKind(), r.State, r.PinnedAt.Format(time.RFC3339), r.URL)
 				}
 				return nil
 			}
@@ -54,18 +56,18 @@ func logsListCmd(a *app, src *string) *cobra.Command {
 			for _, r := range pinned {
 				isPinned[r.Name] = true
 			}
-			fmt.Fprintln(tw, "NAME\tSTATE\tOPERATOR\tPINNED\tURL")
-			for _, r := range list.RFC6962Logs() {
+			fmt.Fprintln(tw, "NAME\tKIND\tSTATE\tOPERATOR\tPINNED\tURL")
+			for _, r := range list.All() {
 				mark := ""
 				if isPinned[r.Name] {
 					mark = "yes"
 				}
-				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", r.Name, r.Log.CurrentState(), r.Operator, mark, r.Log.URL)
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", r.Name, r.Kind, r.Log.CurrentState(), r.Operator, mark, r.Log.URL)
 			}
 			return nil
 		},
 	}
-	cmd.Flags().BoolVar(&available, "available", false, "list every RFC 6962 log in the log list")
+	cmd.Flags().BoolVar(&available, "available", false, "list every log in the log list, RFC 6962 and tiled")
 	return cmd
 }
 
@@ -101,7 +103,12 @@ func logsAddCmd(a *app, src *string) *cobra.Command {
 			if ti := rec.TemporalInterval; ti != nil {
 				fmt.Fprintf(out, "  accepts certificates expiring %s to %s\n", ti.StartInclusive.Format("2006-01-02"), ti.EndExclusive.Format("2006-01-02"))
 			}
-			fmt.Fprintf(out, "  url     %s\n  log_id  %s\n  from log list %s (%s)\n", rec.URL, rec.LogID, rec.LogListVersion, rec.LogListTimestamp)
+			if rec.LogKind() == loglist.KindTiled {
+				fmt.Fprintf(out, "  kind    tiled (static-ct-api)\n  url     %s (monitoring)\n  origin  %s\n", rec.URL, rec.Origin)
+			} else {
+				fmt.Fprintf(out, "  kind    rfc6962\n  url     %s\n", rec.URL)
+			}
+			fmt.Fprintf(out, "  log_id  %s\n  from log list %s (%s)\n", rec.LogID, rec.LogListVersion, rec.LogListTimestamp)
 			return nil
 		},
 	}
@@ -123,21 +130,30 @@ func logsInfoCmd(a *app) *cobra.Command {
 				return err
 			}
 			out := c.OutOrStdout()
-			fmt.Fprintf(out, "name       %s\ndescription %s\noperator   %s\nurl        %s\nlog_id     %s\nstate      %s (at pin)\npinned_at  %s\n",
-				rec.Name, rec.Description, rec.Operator, rec.URL, rec.LogID, rec.State, rec.PinnedAt.Format(time.RFC3339))
+			fmt.Fprintf(out, "name       %s\nkind       %s\ndescription %s\noperator   %s\nurl        %s\n",
+				rec.Name, rec.LogKind(), rec.Description, rec.Operator, rec.URL)
+			if rec.LogKind() == loglist.KindTiled {
+				fmt.Fprintf(out, "submission %s\norigin     %s\n", rec.SubmissionURL, rec.Origin)
+			}
+			fmt.Fprintf(out, "log_id     %s\nstate      %s (at pin)\npinned_at  %s\n", rec.LogID, rec.State, rec.PinnedAt.Format(time.RFC3339))
 			if offline {
 				return nil
 			}
-			pub, err := rec.PublicKey()
+			info, err := logsource.InfoFromRecord(rec)
 			if err != nil {
 				return exitcode.With(exitcode.Verification, fmt.Errorf("pinned record for %s is corrupt: %w", rec.Name, err))
 			}
-			sth, err := rfc6962.New(rec.URL, a.d.HTTP).GetSTH(c.Context())
+			// get-sth or the checkpoint, by the log's kind (amendment A6 §1).
+			src, err := sources.Open(info, a.d.HTTP, logsource.NewChainCache(1), nil)
 			if err != nil {
 				return err
 			}
-			if err := merkle.VerifySTH(pub, sth); err != nil {
+			sth, err := src.Head(c.Context())
+			if errors.Is(err, merkle.ErrBadSignature) {
 				return exitcode.With(exitcode.Verification, fmt.Errorf("signed tree head from %s does not verify with the pinned key: %w", rec.URL, err))
+			}
+			if err != nil {
+				return err
 			}
 			fmt.Fprintf(out, "tree_size  %d\nsth_time   %s\nroot_hash  %x\nsignature  verified with pinned key\n",
 				sth.TreeSize, time.UnixMilli(int64(sth.Timestamp)).UTC().Format(time.RFC3339), sth.RootHash)

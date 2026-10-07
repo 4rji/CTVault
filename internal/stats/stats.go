@@ -48,6 +48,7 @@ type Head struct {
 // LogInput is a pinned log.
 type LogInput struct {
 	Name     string
+	Kind     string // rfc6962 or tiled (amendment A6 §6)
 	State    string
 	PinnedAt time.Time
 	Head     *Head // nil before the first verified head
@@ -76,6 +77,7 @@ type Input struct {
 // LogReport is one log. A nil estimate is unknown.
 type LogReport struct {
 	Name             string    `json:"name"`
+	Kind             string    `json:"kind"`
 	State            string    `json:"state"`
 	PinnedAt         time.Time `json:"pinned_at"`
 	VerifiedHead     *Head     `json:"verified_head"`
@@ -281,7 +283,7 @@ func Compute(in Input) Report {
 	var growthSum float64
 	for _, l := range in.Logs {
 		ms := byLog[l.Name]
-		lr := LogReport{Name: l.Name, State: l.State, PinnedAt: l.PinnedAt, VerifiedHead: l.Head,
+		lr := LogReport{Name: l.Name, Kind: l.Kind, State: l.State, PinnedAt: l.PinnedAt, VerifiedHead: l.Head,
 			IngestRate: rate(ms, in.Now), RateLimitedRatio: rateLimited(ms, in.Now), GrowthRate: growth(ms, in.Now)}
 		if len(ms) > 0 {
 			last := ms[len(ms)-1]
@@ -404,7 +406,7 @@ func Text(r Report) string {
 		return fmt.Sprintf(format, *p)
 	}
 	for _, l := range r.Logs {
-		f("log %s (%s, pinned %s)", l.Name, l.State, l.PinnedAt.Format(time.DateOnly))
+		f("log %s (%s, %s, pinned %s)", l.Name, l.Kind, l.State, l.PinnedAt.Format(time.DateOnly))
 		if l.VerifiedHead != nil {
 			f("  last verified head: tree size %d at %s", l.VerifiedHead.TreeSize, l.VerifiedHead.Timestamp.UTC().Format(time.RFC3339))
 		} else {

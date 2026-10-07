@@ -55,3 +55,20 @@ func StateFromInclusion(index, size uint64, leafHash, root [32]byte, p [][32]byt
 	}
 	return &State{r: r}, nil
 }
+
+// StateFromNodes returns the compact range of leaves [0, size) from its
+// nodes, left to right: the hashes of compact.RangeNodes(0, size), as a
+// tiled log's hash tiles hold them (amendment A6 §5). The nodes are not
+// authenticated here: the caller checks the state's root against a signed
+// head, directly or with a consistency proof, before relying on it.
+func StateFromNodes(size uint64, nodes [][32]byte) (*State, error) {
+	hashes := make([][]byte, len(nodes))
+	for i := range nodes {
+		hashes[i] = append([]byte(nil), nodes[i][:]...) // compact.Range keeps what it is given
+	}
+	r, err := factory.NewRange(0, size, hashes)
+	if err != nil {
+		return nil, fmt.Errorf("%w: compact range of %d entries: %v", ErrInconsistent, size, err)
+	}
+	return &State{r: r}, nil
+}

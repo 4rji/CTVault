@@ -33,7 +33,7 @@ import (
 	"github.com/4rji/ctvault/internal/ingest"
 	"github.com/4rji/ctvault/internal/leaf"
 	"github.com/4rji/ctvault/internal/logsource"
-	"github.com/4rji/ctvault/internal/logsource/rfc6962"
+	"github.com/4rji/ctvault/internal/logsource/sources"
 	"github.com/4rji/ctvault/internal/merkle"
 	"github.com/4rji/ctvault/internal/sample"
 	"github.com/4rji/ctvault/internal/vault"
@@ -254,7 +254,13 @@ func ingestAll(ctx context.Context, s *sample.Sample, o Options, ws string, sv *
 	}
 	defer stop()
 	chains := logsource.NewChainCache(logsource.DefaultChainCacheBytes)
-	src := rfc6962.NewSource(s.LogInfo(url), &http.Client{Timeout: 60 * time.Second}, chains, nil)
+	// The sample's head is the one its batches end under; a tiled source
+	// needs it to read partial tiles (amendment A6 §5).
+	head := s.SignedHead()
+	src, err := sources.Open(s.LogInfo(url), &http.Client{Timeout: 60 * time.Second}, chains, &head)
+	if err != nil {
+		return nil, err
+	}
 
 	cfg := config.Default()
 	var id [16]byte

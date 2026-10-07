@@ -45,9 +45,6 @@ func TestFindArgon2027h1(t *testing.T) {
 
 func TestFindErrors(t *testing.T) {
 	l := load(t)
-	if _, err := l.Find("parcelyard2027h1"); !errors.Is(err, ErrTiledUnsupported) {
-		t.Fatalf("tiled log: got %v", err)
-	}
 	if _, err := l.Find("argon2099h1"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("unknown log: got %v", err)
 	}
@@ -56,16 +53,87 @@ func TestFindErrors(t *testing.T) {
 	if _, err := dup.Find("argon2027h1"); !errors.Is(err, ErrAmbiguous) {
 		t.Fatalf("duplicate name: got %v", err)
 	}
+	// One log of each kind under one name is ambiguous too (amendment A6 §1).
+	cross := *l
+	cross.Operators = append(cross.Operators, Operator{Name: "Copycat", TiledLogs: []TiledLog{{
+		Description: "Copycat 'Argon2027h1'", SubmissionURL: "https://example.test/argon2027h1/", MonitoringURL: "https://mon.example.test/argon2027h1/"}}})
+	if _, err := cross.Find("argon2027h1"); !errors.Is(err, ErrAmbiguous) || !strings.Contains(err.Error(), "mon.example.test") {
+		t.Fatalf("a name shared by an RFC 6962 and a tiled log: got %v", err)
+	}
 }
 
-func TestRFC6962LogsSorted(t *testing.T) {
-	logs := load(t).RFC6962Logs()
-	var names []string
-	for _, r := range logs {
+func TestAllSorted(t *testing.T) {
+	var names, kinds []string
+	for _, r := range load(t).All() {
 		names = append(names, r.Name)
+		kinds = append(kinds, r.Kind)
 	}
-	if strings.Join(names, ",") != "argon2026h2,argon2027h1,xenon2026h2,xenon2027h1" {
+	if strings.Join(names, ",") != "argon2026h2,argon2027h1,parcelyard2027h1,plumbersarms2027h1,xenon2026h2,xenon2027h1" {
 		t.Fatalf("names = %v", names)
+	}
+	if strings.Join(kinds, ",") != "rfc6962,rfc6962,tiled,tiled,rfc6962,rfc6962" {
+		t.Fatalf("kinds = %v", kinds)
+	}
+}
+
+func loadV936(t *testing.T) *List {
+	t.Helper()
+	l, err := Fetch(context.Background(), http.DefaultClient, "../testdata/log_list_v93.6_full.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return l
+}
+
+// TestFindTiled: a tiled log resolves with the fields a pin needs, its url
+// the monitoring prefix (amendment A6 §1).
+func TestFindTiled(t *testing.T) {
+	r, err := loadV936(t).Find("ParcelYard2026h2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Name != "parcelyard2026h2" || r.Kind != KindTiled || r.Operator != "Google" {
+		t.Fatalf("resolved %+v", r)
+	}
+	if r.Log.URL != "https://storage.googleapis.com/parcelyard2026h2.prod.certificate.transparency.goog/" ||
+		r.SubmissionURL != "https://parcelyard2026h2.prod.certificate.transparency.goog/" {
+		t.Fatalf("urls %q %q", r.Log.URL, r.SubmissionURL)
+	}
+	if r.Log.LogID != "utuIpG+cr6QJDoLlk1bbbni0pT9YLbCBl5UkLym2jJg=" || r.Log.MMD != 60 || r.Log.CurrentState() != "usable" ||
+		r.Log.TemporalInterval == nil || r.Log.TemporalInterval.StartInclusive.Format("2006-01-02") != "2026-07-01" {
+		t.Fatalf("pinning fields %+v", r.Log)
+	}
+	if r.Log.Description != "Google 'ParcelYard2026h2' log" {
+		t.Fatalf("description %q", r.Log.Description)
+	}
+	pub, err := ParseKey(r.Log.Key, r.Log.LogID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := pub.(*ecdsa.PublicKey); !ok {
+		t.Fatalf("parcelyard2026h2 uses ECDSA, got %T", pub)
+	}
+	argon, err := loadV936(t).Find("argon2027h1")
+	if err != nil || argon.Kind != KindRFC6962 || argon.SubmissionURL != "" {
+		t.Fatalf("an RFC 6962 log: %+v, %v", argon, err)
+	}
+}
+
+func TestOrigin(t *testing.T) {
+	for in, want := range map[string]string{
+		"https://parcelyard2026h2.prod.certificate.transparency.goog/": "parcelyard2026h2.prod.certificate.transparency.goog",
+		"https://log.sycamore.ct.letsencrypt.org/2026h2/":              "log.sycamore.ct.letsencrypt.org/2026h2",
+		"https://luoshu2027.trustasia.com/luoshu2027":                  "luoshu2027.trustasia.com/luoshu2027",
+		"https://rome.ct.example.com/2024h1//":                         "rome.ct.example.com/2024h1",
+	} {
+		if got, err := Origin(in); err != nil || got != want {
+			t.Errorf("Origin(%q) = %q, %v; want %q", in, got, err, want)
+		}
+	}
+	for _, bad := range []string{"", "parcelyard.example/", "https:///nohost/", "https://a.example/b c/", "https://a.example/b+c/", "ftp://a.example/", "https://a.example/?q=1"} {
+		if got, err := Origin(bad); err == nil {
+			t.Errorf("Origin(%q) = %q; want an error", bad, got)
+		}
 	}
 }
 
@@ -131,6 +199,12 @@ func loadFull(t *testing.T) *List {
 // Plan 2 (partition paths, batch IDs, _COMMIT.json), so every RFC 6962 and
 // tiled log in the real v93.3 list must get a distinct, path-safe name.
 func TestEveryLogInFullListHasAUniqueName(t *testing.T) {
+	for _, l := range []*List{loadFull(t), loadV936(t)} {
+		checkUniqueNames(t, l)
+	}
+}
+
+func checkUniqueNames(t *testing.T, l *List) {
 	valid := regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 	seen := map[string]string{}
 	add := func(name, what string) {
@@ -142,7 +216,6 @@ func TestEveryLogInFullListHasAUniqueName(t *testing.T) {
 		}
 		seen[name] = what
 	}
-	l := loadFull(t)
 	for _, op := range l.Operators {
 		for _, lg := range op.Logs {
 			add(lg.Name(), lg.Description)
@@ -173,9 +246,14 @@ func TestFindNonGoogleLogs(t *testing.T) {
 	if _, err := l.Find("2027h1"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("a bare shard name must not match any log, got %v", err)
 	}
-	for _, tiled := range []string{"sycamore2027h1", "aquamarine2026h2", "tuscolo2028h1"} {
-		if _, err := l.Find(tiled); !errors.Is(err, ErrTiledUnsupported) {
-			t.Errorf("Find(%q): want ErrTiledUnsupported, got %v", tiled, err)
+	for name, mon := range map[string]string{
+		"sycamore2027h1":   "https://mon.sycamore.ct.letsencrypt.org/2027h1/",
+		"aquamarine2026h2": "https://ct-log-api.godaddy.com/aquamarine2026h2/",
+		"tuscolo2028h1":    "https://tuscolo2028h1.skylight.geomys.org/",
+	} {
+		r, err := l.Find(name)
+		if err != nil || r.Kind != KindTiled || r.Log.URL != mon {
+			t.Errorf("Find(%q) = %+v, %v; want the tiled log at %s", name, r, err, mon)
 		}
 	}
 }

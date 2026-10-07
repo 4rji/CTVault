@@ -19,9 +19,11 @@ import (
 	"github.com/4rji/ctvault/internal/fetch"
 	"github.com/4rji/ctvault/internal/fsutil"
 	"github.com/4rji/ctvault/internal/ingest"
+	"github.com/4rji/ctvault/internal/loglist"
 	"github.com/4rji/ctvault/internal/logreg"
 	"github.com/4rji/ctvault/internal/logsource"
-	"github.com/4rji/ctvault/internal/logsource/rfc6962"
+	"github.com/4rji/ctvault/internal/logsource/sources"
+	"github.com/4rji/ctvault/internal/logsource/tiled"
 	"github.com/4rji/ctvault/internal/merkle"
 	"github.com/4rji/ctvault/internal/stop"
 	"github.com/4rji/ctvault/internal/vault"
@@ -48,7 +50,13 @@ type updateRun struct {
 	// production.
 	prepare func(c *cobra.Command) error
 	check   func(cfg config.Config, next uint64) error
+	// tiled keeps each tiled log's source for the whole run, so its issuer
+	// cache outlives a --follow cycle (amendment A6 §3.1). A tiled source
+	// holds no per-batch state: its last head only moves forward.
+	tiled map[tiledKey]*tiled.Source
 }
+
+type tiledKey struct{ name, url, origin string }
 
 // updateHooks let build-tagged files extend update; production has none.
 var updateHooks []func(*cobra.Command, *updateRun)
@@ -56,7 +64,18 @@ var updateHooks []func(*cobra.Command, *updateRun)
 func newUpdateCmd(a *app) *cobra.Command {
 	u := &updateRun{a: a}
 	u.source = func(_ *cobra.Command, info logsource.LogInfo, chains *logsource.ChainCache, last *logsource.SignedHead) (logsource.LogSource, uint64, func(), error) {
-		return rfc6962.NewSource(info, a.d.HTTP, chains, last), 0, func() {}, nil
+		if info.Kind == loglist.KindTiled {
+			k := tiledKey{info.Name, info.URL, info.Origin}
+			if u.tiled == nil {
+				u.tiled = map[tiledKey]*tiled.Source{}
+			}
+			if u.tiled[k] == nil {
+				u.tiled[k] = tiled.NewSource(info, a.d.HTTP, last)
+			}
+			return u.tiled[k], 0, func() {}, nil
+		}
+		src, err := sources.Open(info, a.d.HTTP, chains, last)
+		return src, 0, func() {}, err
 	}
 	cmd := &cobra.Command{
 		Use:     "update [--follow] [--until N] [--log NAME]",
@@ -225,6 +244,11 @@ func (u *updateRun) cycle(c *cobra.Command, stops *stop.Contexts, w *ingest.Writ
 		return err
 	}
 	defer closeSrc()
+	ts, isTiled := src.(*tiled.Source)
+	var before tiled.Counters
+	if isTiled {
+		before = ts.Counters()
+	}
 	head, err := u.head(stops.Hard, src, rec.Name, last, w.Tip(rec.Name), state)
 	if err != nil {
 		return err
@@ -264,6 +288,11 @@ func (u *updateRun) cycle(c *cobra.Command, stops *stop.Contexts, w *ingest.Writ
 		if _, _, err := w.RebuildTurn(stops.Hard, cfg.Rebuild.BatchesPerTurn); err != nil {
 			return err
 		}
+	}
+	if isTiled { // this cycle's share (amendment A6 §6)
+		c := ts.Counters()
+		fmt.Fprintf(out, "%s: %d issuers fetched, %d partial tiles read from full tiles\n", rec.Name,
+			c.IssuersFetched-before.IssuersFetched, c.PartialFallbacks-before.PartialFallbacks)
 	}
 	return nil
 }

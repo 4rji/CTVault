@@ -27,12 +27,16 @@ var (
 
 var validName = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 
-// Record is a pinned log.
+// Record is a pinned log. URL is where CTVault reads: the log URL of an
+// RFC 6962 log, the monitoring prefix of a tiled one (amendment A6 §1).
 type Record struct {
 	Name             string            `json:"name"`
+	Kind             string            `json:"kind,omitempty"` // empty in records pinned before A6: RFC 6962
 	Operator         string            `json:"operator"`
 	Description      string            `json:"description"`
 	URL              string            `json:"url"`
+	SubmissionURL    string            `json:"submission_url,omitempty"` // tiled only
+	Origin           string            `json:"origin,omitempty"`         // tiled only: the checkpoint origin, from SubmissionURL
 	LogID            string            `json:"log_id"`
 	Key              string            `json:"key"`
 	MMD              int               `json:"mmd"`
@@ -43,14 +47,51 @@ type Record struct {
 	PinnedAt         time.Time         `json:"pinned_at"`
 }
 
-// FromList builds a record from a resolved log-list entry.
+// FromList builds a record from a resolved log-list entry. A tiled log's
+// origin is computed here, once; an unusable submission URL leaves it empty,
+// and Add refuses the record.
 func FromList(l *loglist.List, r loglist.Resolved, now time.Time) Record {
-	return Record{
-		Name: r.Name, Operator: r.Operator, Description: r.Log.Description, URL: r.Log.URL,
+	rec := Record{
+		Name: r.Name, Kind: r.Kind, Operator: r.Operator, Description: r.Log.Description, URL: r.Log.URL,
 		LogID: r.Log.LogID, Key: r.Log.Key, MMD: r.Log.MMD, State: r.Log.CurrentState(),
 		TemporalInterval: r.Log.TemporalInterval, LogListVersion: l.Version, LogListTimestamp: l.Timestamp,
 		PinnedAt: now.UTC(),
 	}
+	if r.Kind == loglist.KindTiled {
+		rec.SubmissionURL = r.SubmissionURL
+		rec.Origin, _ = loglist.Origin(r.SubmissionURL)
+	}
+	return rec
+}
+
+// LogKind is the record's kind; a record without one is RFC 6962.
+func (r Record) LogKind() string {
+	if r.Kind == "" {
+		return loglist.KindRFC6962
+	}
+	return r.Kind
+}
+
+// CheckKind checks the kind-specific fields: a tiled record has a
+// submission URL and the origin it gives; an RFC 6962 record has neither.
+func (r Record) CheckKind() error {
+	switch r.LogKind() {
+	case loglist.KindRFC6962:
+		if r.SubmissionURL != "" || r.Origin != "" {
+			return fmt.Errorf("log %s: an RFC 6962 record has no submission URL or origin", r.Name)
+		}
+	case loglist.KindTiled:
+		o, err := loglist.Origin(r.SubmissionURL)
+		if err != nil {
+			return fmt.Errorf("log %s: %w", r.Name, err)
+		}
+		if r.Origin != o {
+			return fmt.Errorf("log %s: origin %q does not match the submission URL's %q", r.Name, r.Origin, o)
+		}
+	default:
+		return fmt.Errorf("log %s: unknown kind %q", r.Name, r.Kind)
+	}
+	return nil
 }
 
 // PublicKey returns the pinned key after re-checking it against the log ID.
@@ -69,6 +110,9 @@ func path(root, name string) (string, error) {
 // Add pins a log. The caller must hold the writer lock.
 func Add(root string, r Record) error {
 	if _, err := r.PublicKey(); err != nil {
+		return fmt.Errorf("refusing to pin %s: %w", r.Name, err)
+	}
+	if err := r.CheckKind(); err != nil {
 		return fmt.Errorf("refusing to pin %s: %w", r.Name, err)
 	}
 	p, err := path(root, r.Name)

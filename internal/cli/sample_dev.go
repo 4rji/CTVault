@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -29,6 +30,10 @@ func init() { extraCommands = append(extraCommands, newSampleCmd) }
 // sampleLimits are amendment A1 §2.1's rules; tests in this package shrink
 // them. There is no flag or environment variable for them.
 var sampleLimits = sample.DefaultLimits
+
+// sampleTiledLimits are the same rules aligned to tiles, for tiled logs
+// (amendment A6 §5); tests shrink them too.
+var sampleTiledLimits = sample.TiledLimits
 
 func newSampleCmd(a *app) *cobra.Command {
 	return groupCmd("sample", "Capture, verify and measure real-data samples (dev build only)",
@@ -77,9 +82,6 @@ func sampleCaptureCmd(a *app) *cobra.Command {
 				}
 				opts.Kind, opts.Start = sample.Representative, s
 			}
-			if err := sampleLimits.Check(opts.Kind, 0, count); err != nil {
-				return exitcode.With(exitcode.Usage, err)
-			}
 			list, err := loglist.Fetch(c.Context(), a.d.HTTP, logList)
 			if err != nil {
 				return err
@@ -92,6 +94,16 @@ func sampleCaptureCmd(a *app) *cobra.Command {
 			info, err := logsource.InfoFromRecord(rec)
 			if err != nil {
 				return exitcode.With(exitcode.Verification, err)
+			}
+			tiledLog := info.Kind == loglist.KindTiled
+			if tiledLog { // whole tiles (amendment A6 §5)
+				opts.Limits = sampleTiledLimits
+				if !c.Flags().Changed("entries") {
+					count, opts.Count = sampleTiledLimits.Min, sampleTiledLimits.Min
+				}
+			}
+			if err := opts.Limits.Check(opts.Kind, 0, count); err != nil {
+				return exitcode.With(exitcode.Usage, err)
 			}
 			opts.Key, opts.LogListVersion = rec.Key, rec.LogListVersion
 
@@ -110,8 +122,13 @@ func sampleCaptureCmd(a *app) *cobra.Command {
 				fmt.Fprintln(errOut, "interrupted: stopping the capture; no sample will be written")
 			}, nil)
 			defer stops.Close()
-			src := rfc6962.NewSource(info, a.d.HTTP, logsource.NewChainCache(logsource.DefaultChainCacheBytes), nil)
-			s, err := sample.Capture(stops.Soft, samples, src, opts)
+			var s *sample.Sample
+			if tiledLog {
+				s, err = sample.CaptureTiled(stops.Soft, samples, info, a.d.HTTP, opts)
+			} else {
+				src := rfc6962.NewSource(info, a.d.HTTP, logsource.NewChainCache(logsource.DefaultChainCacheBytes), nil)
+				s, err = sample.Capture(stops.Soft, samples, src, opts)
+			}
 			if err != nil {
 				return sampleErr(err)
 			}
@@ -121,7 +138,7 @@ func sampleCaptureCmd(a *app) *cobra.Command {
 	}
 	f := cmd.Flags()
 	f.StringVar(&logName, "log", "", "log name from Chrome's log list (for example argon2027h1)")
-	f.Uint64Var(&count, "entries", 100000, "number of entries (50,000-500,000, a multiple of 5,000)")
+	f.Uint64Var(&count, "entries", 100000, "number of entries (50,000-500,000, a multiple of 5,000; for a tiled log 51,200-512,000, a multiple of 256, default 51,200)")
 	f.StringVar(&start, "start", "", "first index of a representative window, or \"head\" for the newest whole window")
 	f.StringVar(&suffix, "suffix", "", "folder suffix, to capture an existing range again")
 	f.StringVar(&logList, "log-list", a.d.LogListSource, "log list URL or file")
@@ -188,6 +205,25 @@ func printSample(c *cobra.Command, s *sample.Sample, verb string) {
 	fmt.Fprintf(out, "%s %s sample %s\n", verb, m.Kind, m.ID(filepath.Base(s.Dir)))
 	fmt.Fprintf(out, "  folder     %s\n  entries    [%d, %d) of %s\n  head       tree_size %d, signature verified\n",
 		s.Dir, m.Start, m.Start+m.Count, m.Log.Name, m.Head.TreeSize)
+	if s.Tiled() { // the files as served (amendment A6 §5)
+		var data, hash, issuers int
+		var total, dataBytes int64
+		for p, f := range m.Files {
+			total += f.Bytes
+			switch {
+			case strings.HasPrefix(p, "tile/data/"):
+				data++
+				dataBytes += f.Bytes
+			case strings.HasPrefix(p, "tile/"):
+				hash++
+			case strings.HasPrefix(p, "issuer/"):
+				issuers++
+			}
+		}
+		fmt.Fprintf(out, "  files      %d data tiles, %d hash tiles, %d issuers\n  page size  %d\n  size       %d bytes (%d B per entry in data tiles)\n",
+			data, hash, issuers, m.PageSize, total, dataBytes/int64(m.Count))
+		return
+	}
 	fmt.Fprintf(out, "  proofs     %d consistency", len(s.Proofs.Consistency))
 	if s.Proofs.Inclusion != nil {
 		fmt.Fprintf(out, ", 1 inclusion")

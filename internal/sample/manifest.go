@@ -92,6 +92,7 @@ type LogRef struct {
 	LogID          string `json:"log_id"` // base64, SHA-256 of Key
 	Key            string `json:"key"`    // base64 SubjectPublicKeyInfo
 	URL            string `json:"url"`
+	Origin         string `json:"origin,omitempty"` // tiled samples: the checkpoint origin
 	LogListVersion string `json:"log_list_version"`
 }
 
@@ -112,6 +113,7 @@ type HeadSummary struct {
 // Manifest is sample.json.
 type Manifest struct {
 	Format         int                `json:"format"`
+	Protocol       string             `json:"protocol,omitempty"` // ProtocolTiled, or empty for RFC 6962
 	Kind           Kind               `json:"kind"`
 	Log            LogRef             `json:"log"`
 	HeadRaw        []byte             `json:"head_raw"` // get-sth body exactly as received (base64 in JSON)

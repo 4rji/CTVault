@@ -35,7 +35,6 @@ import (
 	"golang.org/x/time/rate"
 
 	"github.com/4rji/ctvault/internal/logsource"
-	"github.com/4rji/ctvault/internal/logsource/rfc6962"
 )
 
 // ErrStalled means no entry was released for Options.StallTimeout.
@@ -143,6 +142,9 @@ type run struct {
 // the calling goroutine. It returns when the range is done, emit fails, the
 // context ends, a request fails permanently, or the run stalls.
 func Run(ctx context.Context, src logsource.LogSource, start, end uint64, opts Options, emit func(logsource.RawEntry) error) (Stats, error) {
+	if ps, ok := src.(logsource.PageSizer); ok && ps.PageSize() > 0 {
+		opts.PageSize = ps.PageSize() // the source knows its unit (amendment A6 §4.4)
+	}
 	opts = opts.withDefaults()
 	r := &run{src: src, opts: opts, end: end, buf: map[uint64][]logsource.RawEntry{}, next: start,
 		progress: time.Now(), now: time.Now, rps: opts.MaxRPS, lim: rate.NewLimiter(rate.Limit(opts.MaxRPS), 1)}
@@ -318,11 +320,11 @@ func (r *run) worker(ctx context.Context) {
 func (r *run) deliver(t task, entries []logsource.RawEntry) error {
 	n := uint64(len(entries))
 	if n == 0 || n > t.end-t.start {
-		return fmt.Errorf("%w: %d entries for a request of %d", rfc6962.ErrMalformed, n, t.end-t.start)
+		return fmt.Errorf("%w: %d entries for a request of %d", logsource.ErrMalformed, n, t.end-t.start)
 	}
 	for i := range entries {
 		if entries[i].Index != t.start+uint64(i) {
-			return fmt.Errorf("%w: entry %d carries index %d", rfc6962.ErrMalformed, t.start+uint64(i), entries[i].Index)
+			return fmt.Errorf("%w: entry %d carries index %d", logsource.ErrMalformed, t.start+uint64(i), entries[i].Index)
 		}
 	}
 	r.success()
@@ -347,7 +349,7 @@ func (r *run) deliver(t task, entries []logsource.RawEntry) error {
 // retryable classifies an error and adjusts the rate. Context errors and
 // local failures (a full chain cache) are permanent.
 func (r *run) retryable(err error, t task) bool {
-	var he *rfc6962.HTTPError
+	var he *logsource.HTTPError
 	var ne net.Error
 	switch {
 	case errors.As(err, &he) && (he.Status == 429 || he.Status >= 500):
@@ -361,7 +363,7 @@ func (r *run) retryable(err error, t task) bool {
 	case errors.As(err, &he):
 		atomic.AddInt64(&r.stats.OtherErrors, 1)
 		return t.attempt < maxOtherRetries
-	case errors.Is(err, rfc6962.ErrMalformed):
+	case errors.Is(err, logsource.ErrMalformed):
 		atomic.AddInt64(&r.stats.FramingErrors, 1)
 		return true
 	case errors.As(err, &ne):

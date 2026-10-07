@@ -8,7 +8,6 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,36 +16,22 @@ import (
 	"strings"
 	"time"
 
+	"github.com/4rji/ctvault/internal/logsource"
 	"github.com/4rji/ctvault/internal/merkle"
 )
 
 // maxBody bounds response bodies; a full get-entries page is well under this.
 const maxBody = 16 << 20
 
-// ErrRateLimited is matched by an *HTTPError with status 429.
-var ErrRateLimited = errors.New("rate limited by log (HTTP 429)")
-
-// ErrMalformed means the log answered 200 with an unusable body.
-var ErrMalformed = errors.New("malformed log response")
+// The HTTP errors are logsource's, shared with the tiled source (amendment
+// A6 §2.1); these names stay for existing callers.
+var (
+	ErrRateLimited = logsource.ErrRateLimited
+	ErrMalformed   = logsource.ErrMalformed
+)
 
 // HTTPError is a non-200 answer from the log.
-type HTTPError struct {
-	URL        string
-	Status     int
-	Body       string
-	RetryAfter time.Duration
-}
-
-// Error quotes the body, so control characters a server sends (ANSI escapes,
-// for example) are shown escaped instead of acting on the terminal (Plan 1
-// review, minor 12).
-func (e *HTTPError) Error() string {
-	return fmt.Sprintf("%s: HTTP %d: %q", e.URL, e.Status, e.Body)
-}
-
-func (e *HTTPError) Is(target error) bool {
-	return target == ErrRateLimited && e.Status == http.StatusTooManyRequests
-}
+type HTTPError = logsource.HTTPError
 
 // Client talks to one log.
 type Client struct {

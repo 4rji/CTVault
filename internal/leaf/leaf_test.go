@@ -38,7 +38,7 @@ func TestCodesAreStable(t *testing.T) {
 	want := []string{"leaf_bad_version", "leaf_bad_leaf_type", "leaf_unknown_entry_type", "leaf_truncated",
 		"leaf_trailing_bytes", "extra_truncated", "extra_trailing_bytes", "chain_cert_empty",
 		"chain_issuer_missing", "chain_issuer_ambiguous", "issuer_key_hash_mismatch",
-		"precert_tbs_mismatch", "issuance_key_unavailable"}
+		"precert_tbs_mismatch", "issuance_key_unavailable", "leaf_index_mismatch"}
 	if len(leaf.Codes) != len(want) {
 		t.Fatalf("%d codes, want %d", len(leaf.Codes), len(want))
 	}
@@ -172,5 +172,50 @@ func TestExtraDataCodes(t *testing.T) {
 	}
 	if e := leaf.Decode(fin.LeafInput, ctlogtest.Chain()); e.Code != leaf.OK || e.Chain == nil || len(e.Chain) != 0 {
 		t.Fatalf("an empty chain is valid for x509 entries: %q %v", e.Code, e.Chain)
+	}
+}
+
+// TestCheckLeafIndex: static-ct-api's leaf_index extension must be present
+// once and equal the entry's position; anything else is leaf_index_mismatch,
+// and an earlier code is kept (amendment A6 §3.2).
+func TestCheckLeafIndex(t *testing.T) {
+	ext := func(parts ...[]byte) []byte {
+		var b []byte
+		for _, p := range parts {
+			b = append(b, p...)
+		}
+		return b
+	}
+	idx := func(v uint64) []byte {
+		return []byte{0, 0, 5, byte(v >> 32), byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)}
+	}
+	other := []byte{7, 0, 1, 9}
+	for name, c := range map[string]struct {
+		exts []byte
+		want leaf.Code
+	}{
+		"right":               {idx(1587930800), leaf.OK},
+		"right, with another": {ext(other, idx(1587930800)), leaf.OK},
+		"missing":             {nil, leaf.LeafIndexMismatch},
+		"only another":        {other, leaf.LeafIndexMismatch},
+		"wrong":               {idx(1587930801), leaf.LeafIndexMismatch},
+		"twice":               {ext(idx(1587930800), idx(1587930800)), leaf.LeafIndexMismatch},
+		"another type twice":  {ext(other, other, idx(1587930800)), leaf.LeafIndexMismatch},
+		"four bytes":          {[]byte{0, 0, 4, 0x5e, 0xa5, 0x2b, 0xb0}, leaf.LeafIndexMismatch},
+		"truncated":           {idx(1587930800)[:6], leaf.LeafIndexMismatch},
+	} {
+		e := leaf.Entry{}
+		leaf.CheckLeafIndex(&e, c.exts, 1587930800)
+		if e.Code != c.want {
+			t.Errorf("%s: %q, want %q", name, e.Code, c.want)
+		}
+	}
+	e := leaf.Entry{Code: leaf.PrecertTBSMismatch}
+	leaf.CheckLeafIndex(&e, nil, 0)
+	if e.Code != leaf.PrecertTBSMismatch {
+		t.Errorf("an earlier code was replaced by %q", e.Code)
+	}
+	if leaf.LeafIndexMismatch.Explain() == "" || leaf.LeafIndexMismatch.LeafStructure() {
+		t.Error("leaf_index_mismatch needs an explanation and keeps the certificate")
 	}
 }

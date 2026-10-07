@@ -1,7 +1,9 @@
 // Package logsource defines how CTVault reads one CT log (spec §5.1): the
 // LogSource interface, the entries it yields, signed-head checks shared by
-// every implementation, and the per-batch chain cache. The RFC 6962
-// implementation lives in logsource/rfc6962; a tiled one can follow later.
+// every implementation, the per-batch chain cache, and the HTTP errors both
+// implementations report. The RFC 6962 implementation lives in
+// logsource/rfc6962, the tiled one (static-ct-api, amendment A6) in
+// logsource/tiled.
 package logsource
 
 import (
@@ -17,26 +19,32 @@ import (
 	"github.com/4rji/ctvault/internal/merkle"
 )
 
-// LogInfo is a pinned log's identity.
+// LogInfo is a pinned log's identity. URL is where CTVault reads: the log
+// URL, or a tiled log's monitoring prefix (amendment A6 §1).
 type LogInfo struct {
 	Name      string
+	Kind      string // loglist.KindRFC6962 or loglist.KindTiled
 	LogID     [32]byte
 	PublicKey crypto.PublicKey
 	URL       string
+	Origin    string // tiled only: the checkpoint origin pinned with the log
 }
 
 // InfoFromRecord turns a pinned log into a LogInfo, re-checking that the key
-// hashes to the log ID.
+// hashes to the log ID and that the kind's fields agree.
 func InfoFromRecord(r logreg.Record) (LogInfo, error) {
 	pub, err := r.PublicKey()
 	if err != nil {
 		return LogInfo{}, fmt.Errorf("log %s: %w", r.Name, err)
 	}
+	if err := r.CheckKind(); err != nil {
+		return LogInfo{}, err
+	}
 	id, err := base64.StdEncoding.DecodeString(r.LogID)
 	if err != nil || len(id) != 32 {
 		return LogInfo{}, fmt.Errorf("log %s: log_id is not a base64 32-byte hash", r.Name)
 	}
-	info := LogInfo{Name: r.Name, PublicKey: pub, URL: r.URL}
+	info := LogInfo{Name: r.Name, Kind: r.LogKind(), PublicKey: pub, URL: r.URL, Origin: r.Origin}
 	copy(info.LogID[:], id)
 	return info, nil
 }
@@ -55,10 +63,14 @@ type RawEntry struct {
 	ExtraData []byte
 	Leaf      leaf.Entry
 	Chain     [][32]byte // chain certificates by SHA-256; nil if the chain could not be decoded
+	// TileLeaf is a tiled log's entry exactly as served; LeafInput and
+	// ExtraData are then its RFC 6962 form, ExtraData rebuilt from the
+	// issuers (amendment A6 §3). Nil for RFC 6962 logs.
+	TileLeaf []byte
 }
 
 // Size is the entry's weight in the fetcher's byte-bounded reorder buffer.
-func (e *RawEntry) Size() int { return len(e.LeafInput) + len(e.ExtraData) }
+func (e *RawEntry) Size() int { return len(e.LeafInput) + len(e.ExtraData) + len(e.TileLeaf) }
 
 // LogSource reads one log. Fetch covers [start, end) and may return fewer
 // entries than asked, but at least one; it never returns more.
@@ -68,6 +80,13 @@ type LogSource interface {
 	Fetch(ctx context.Context, start, end uint64) ([]RawEntry, error)
 	ConsistencyProof(ctx context.Context, first, second uint64) ([][32]byte, error)
 	Issuer(ctx context.Context, fp [32]byte) ([]byte, error)
+}
+
+// PageSizer is a LogSource that states the size its requests should align
+// to: a tiled log is read one 256-entry tile per request (amendment A6
+// §4.4). The fetcher uses it instead of its configured page size.
+type PageSizer interface {
+	PageSize() int
 }
 
 // ErrIncident is matched by every *IncidentError: log misbehaviour that must

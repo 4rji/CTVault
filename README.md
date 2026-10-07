@@ -3,10 +3,12 @@
 A local, cryptographically verified Certificate Transparency research archive.
 Design: `docs/superpowers/specs/2026-10-04-ctvault-design.md`.
 
-**Status:** Plan 6B (version transitions: upgrades in turns, `gc`,
-`rebuild --in-place`) and 6A (`verify`, `repair`) on top of Plan 5 (`explore`,
-the terminal UI) and Plan 4 (the read path: `search`, `fetch`, export, the
-post-commit audit).
+**Status:** tiled logs (amendment A6): static-ct-api logs are pinned,
+ingested, followed and verified like RFC 6962 logs, in the same vault. This
+builds on Plan 6: 6C (the power-loss gate, passing), 6B (version transitions:
+upgrades in turns, `gc`, `rebuild --in-place`) and 6A (`verify`, `repair`);
+Plan 5 (`explore`, the terminal UI) and Plan 4 (the read path: `search`,
+`fetch`, export, the post-commit audit).
 `ctvault update` ingests pinned logs into the vault:
 - Every batch is verified against a signed tree head.
 - Every unique certificate is stored once, compressed with libzstd and a
@@ -23,6 +25,9 @@ post-commit audit).
 - A crash at any point recovers to the last committed batch. A test suite
   proves it by killing the writer (SIGKILL) at every commit boundary and at
   random moments.
+- So does a power loss: the power-loss gate records a workload through the
+  kernel's `dm-log-writes`, replays it to every point where the disk had
+  confirmed a flush, and checks each one (see below).
 
 `search`, `fetch` and `explore` read a fixed snapshot of the committed
 batches, take no lock and never write into the vault, so they run while
@@ -49,7 +54,8 @@ go test -race ./...
 |---|---|---|
 | Unit tests, fake-log fault injection, crash boundaries and a 25-kill loop, production guard tests | `go test -race ./...` | none |
 | Dev-build behaviour, measurements | `go test -race -tags ctvault_dev ./...` | none |
-| Real-data end to end, recovery and rebuild equivalence, measurement reports (skip without a cached sample) | `go test -tags realdata -timeout 90m ./internal/integration/` | none (loopback replay) |
+| Real-data end to end, recovery and rebuild equivalence, measurement reports, the tiled sample end to end (skip without a cached sample) | `go test -tags realdata -timeout 90m ./internal/integration/` | none (loopback replay) |
+| The power-loss gate (root: loop devices, `dm-log-writes`); about 5 minutes | `go test -c -tags powerloss -o /mnt/disk/ctvault/powerloss/powerloss.test ./internal/powerloss/`, then `sudo /mnt/disk/ctvault/powerloss/powerloss.test -test.run TestPowerLoss -test.v -test.timeout 2h` | none; files under `/mnt/disk/ctvault/powerloss/` |
 | Extractor against `crypto/x509` on every certificate of both samples | `go test -tags realdata ./internal/extract/` | none |
 | Long crash loop (200 kills) | `go test -tags nightly -run RandomKill ./internal/commit/` | none |
 | Leaf decoder fuzzing | `go test -run '^$' -fuzz FuzzDecode -fuzztime 60s ./internal/leaf/` | none |
@@ -81,8 +87,9 @@ go test -race ./...
 ./ctvault init /mnt/ctvault
 export CTVAULT_ROOT=/mnt/ctvault
 
-./ctvault logs list --available        # RFC 6962 logs in Chrome's log list
+./ctvault logs list --available        # every log in Chrome's log list, with its kind
 ./ctvault logs add argon2027h1          # pin the log and its public key
+./ctvault logs add parcelyard2027h1     # a tiled (static-ct-api) log, pinned the same way
 ./ctvault logs info argon2027h1         # fetch and verify the live signed tree head
 ./ctvault vault add-dir /mnt/disk2/ctvault-vault   # optional extra vault disk
 
@@ -121,6 +128,30 @@ export CTVAULT_ROOT=/mnt/ctvault
   `cert_id` values can have gaps.
 - **A batch that cannot be cleaned up** (the vault cannot be cut back) stops
   `update`, even with `--follow`. The next start recovers it.
+
+**Tiled (static-ct-api) logs** (amendment A6) work the same way: most of
+Chrome's current logs are tiled, and Google's 2027h2 logs and Let's
+Encrypt's current ones are tiled only.
+- **Pinning:** `logs add` records the kind, the monitoring prefix (where
+  CTVault reads) and the checkpoint origin (the submission URL without its
+  scheme). Records pinned earlier have no kind and stay RFC 6962.
+- **Signed heads:** the `checkpoint` must name the pinned origin and carry
+  exactly one RFC 6962 signature from the pinned key. Other signatures (the
+  log's Ed25519 one, witnesses) are ignored. A wrong origin or a missing key
+  line is an incident, like a bad signature.
+- **Entries:** one 256-entry data tile per request. Each entry becomes the
+  same `leaf_input` and `extra_data` an RFC 6962 log would serve, so
+  decoding, dedup and the dataset are identical; a test ingests one fake log
+  both ways and compares the files byte for byte. Issuers are fetched once
+  per run from `issuer/<sha256>` and checked against their fingerprint.
+- **Proofs:** consistency proofs are computed from hash tiles and checked
+  against both roots, so a wrong tile is caught like a wrong proof.
+- **Partial tiles:** `update` still ingests up to the signed head. A partial
+  tile the log has already replaced is read from the full tile.
+- **New leaf error:** `leaf_index_mismatch`, when an entry's `leaf_index`
+  extension is missing or differs from its position. The certificate is kept.
+- Each cycle reports how many issuers were fetched and how many partial tiles
+  were read from full ones.
 
 The dataset can be queried without CTVault running:
 
@@ -261,6 +292,26 @@ afterwards, because its `VAULT_ID` records the old filesystem's UUID.
   (exit 5) instead of feeding wrong data.
 - Representative samples are for measurements only.
 
+**A tiled log's sample** mirrors the log's files exactly as served: the
+checkpoint, the data and level-0 tiles of the range, every hash tile a
+consistency proof from any position in the range needs, and every issuer it
+references (amendment A6 §5).
+
+```bash
+./ctvault-dev sample capture --log parcelyard2027h1                    # [0, 51200)
+./ctvault-dev sample capture --log parcelyard2026h2 --start head      # the newest whole window
+```
+
+- `--entries` is 51,200-512,000 and a multiple of 256 (the default for a
+  tiled log is 51,200); `--start` is a multiple of 256.
+- Measured on 2026-10-07: `parcelyard2027h1 [0, 51200)` took 20 seconds and
+  112 MB (200 data tiles, 206 hash tiles, 179 issuers; 2,236 B per entry);
+  a window at `parcelyard2026h2`'s head took 68 seconds and 65 MB
+  (1,227 B per entry).
+- `sample verify`, `measure` and `update --replay` read it through the
+  tiled source over a loopback static site. A representative tiled sample
+  takes its start state from hash tiles instead of an inclusion proof.
+
 ### Dev vaults and replay
 
 A dev vault lives under `~/.cache/ctvault-dev/vaults/` and starts with
@@ -275,8 +326,10 @@ same client, fetcher and writer as the live log:
 ```
 
 - `--replay` refuses representative samples and samples of another log.
-- With `--replay`, `ingest.batch_size` and `--until` must be multiples of
-  5,000, the sample's proof boundaries.
+- With `--replay` of an RFC 6962 sample, `ingest.batch_size` and `--until`
+  must be multiples of 5,000, the sample's proof boundaries. A tiled sample
+  accepts any.
+- A tiled sample needs the log pinned as tiled, with the same origin.
 - Measured on 2026-10-05: the 100,000-entry canonical sample replays in
   about 30 seconds, including the one-time training of the compression
   dictionary (a few seconds with libzstd).

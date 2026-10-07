@@ -1,5 +1,6 @@
 // Package loglist reads Chrome's CT log list v3 and resolves CTVault log
-// names to RFC 6962 logs with validated public keys.
+// names to RFC 6962 and tiled (static-ct-api) logs with validated public
+// keys.
 package loglist
 
 import (
@@ -28,10 +29,15 @@ const DefaultURL = "https://www.gstatic.com/ct/log_list/v3/log_list.json"
 const maxListSize = 16 << 20
 
 var (
-	ErrNotFound         = errors.New("log not found in log list")
-	ErrAmbiguous        = errors.New("log name is ambiguous")
-	ErrTiledUnsupported = errors.New("static-ct-api (tiled) logs are not supported in v1")
-	ErrBadKey           = errors.New("log key does not match log_id")
+	ErrNotFound  = errors.New("log not found in log list")
+	ErrAmbiguous = errors.New("log name is ambiguous")
+	ErrBadKey    = errors.New("log key does not match log_id")
+)
+
+// The two kinds of log a pinned record can be (amendment A6 §1).
+const (
+	KindRFC6962 = "rfc6962"
+	KindTiled   = "tiled" // static-ct-api, after the log list's tiled_logs key
 )
 
 // List is the subset of the v3 schema CTVault uses.
@@ -67,9 +73,21 @@ type Log struct {
 }
 
 type TiledLog struct {
-	Description   string `json:"description"`
-	SubmissionURL string `json:"submission_url"`
-	MonitoringURL string `json:"monitoring_url"`
+	Description      string    `json:"description"`
+	LogID            string    `json:"log_id"`
+	Key              string    `json:"key"`
+	SubmissionURL    string    `json:"submission_url"`
+	MonitoringURL    string    `json:"monitoring_url"`
+	MMD              int       `json:"mmd"`
+	State            State     `json:"state"`
+	TemporalInterval *Interval `json:"temporal_interval"`
+}
+
+// asLog is the tiled log in Log's shape, its URL the monitoring prefix:
+// where CTVault reads (amendment A6 §1).
+func (tl TiledLog) asLog() Log {
+	return Log{Description: tl.Description, LogID: tl.LogID, Key: tl.Key, URL: tl.MonitoringURL,
+		MMD: tl.MMD, State: tl.State, TemporalInterval: tl.TemporalInterval}
 }
 
 // Parse decodes a log list and rejects anything that is not one (for example
@@ -157,34 +175,42 @@ func (lg Log) Name() string { return LogName(lg.Description, lg.URL) }
 // Name is the tiled log's CTVault name.
 func (tl TiledLog) Name() string { return LogName(tl.Description, tl.SubmissionURL) }
 
-// Resolved is one named RFC 6962 log.
+// Resolved is one named log of either kind. For a tiled log, Log.URL is the
+// monitoring prefix and SubmissionURL is set.
 type Resolved struct {
-	Name     string
-	Operator string
-	Log      Log
+	Name          string
+	Operator      string
+	Kind          string // KindRFC6962 or KindTiled
+	Log           Log
+	SubmissionURL string
 }
 
-// Find resolves a CTVault log name. RFC 6962 logs are matched first; a name
-// that only matches a tiled log reports ErrTiledUnsupported.
+// all lists every log of both kinds, in list order.
+func (l *List) all() []Resolved {
+	var out []Resolved
+	for _, op := range l.Operators {
+		for _, lg := range op.Logs {
+			out = append(out, Resolved{Name: lg.Name(), Operator: op.Name, Kind: KindRFC6962, Log: lg})
+		}
+		for _, tl := range op.TiledLogs {
+			out = append(out, Resolved{Name: tl.Name(), Operator: op.Name, Kind: KindTiled, Log: tl.asLog(), SubmissionURL: tl.SubmissionURL})
+		}
+	}
+	return out
+}
+
+// Find resolves a CTVault log name among logs of both kinds. A name matched
+// by more than one log, of either kind, is ambiguous.
 func (l *List) Find(name string) (Resolved, error) {
 	name = strings.ToLower(strings.TrimSpace(name))
 	var found []Resolved
-	for _, op := range l.Operators {
-		for _, lg := range op.Logs {
-			if lg.Name() == name {
-				found = append(found, Resolved{Name: name, Operator: op.Name, Log: lg})
-			}
+	for _, r := range l.all() {
+		if r.Name == name {
+			found = append(found, r)
 		}
 	}
 	switch len(found) {
 	case 0:
-		for _, op := range l.Operators {
-			for _, tl := range op.TiledLogs {
-				if tl.Name() == name {
-					return Resolved{}, fmt.Errorf("%w: %s (%s)", ErrTiledUnsupported, name, tl.Description)
-				}
-			}
-		}
 		return Resolved{}, fmt.Errorf("%w: %q", ErrNotFound, name)
 	case 1:
 		return found[0], nil
@@ -197,16 +223,26 @@ func (l *List) Find(name string) (Resolved, error) {
 	}
 }
 
-// RFC6962Logs lists every RFC 6962 log, sorted by name.
-func (l *List) RFC6962Logs() []Resolved {
-	var out []Resolved
-	for _, op := range l.Operators {
-		for _, lg := range op.Logs {
-			out = append(out, Resolved{Name: lg.Name(), Operator: op.Name, Log: lg})
-		}
-	}
-	slices.SortFunc(out, func(a, b Resolved) int { return strings.Compare(a.Name, b.Name) })
+// All lists every log of both kinds, sorted by name.
+func (l *List) All() []Resolved {
+	out := l.all()
+	slices.SortStableFunc(out, func(a, b Resolved) int { return strings.Compare(a.Name, b.Name) })
 	return out
+}
+
+// Origin is a tiled log's checkpoint origin: its submission URL without the
+// scheme and trailing slashes (static-ct-api, "Checkpoints"). It refuses
+// what cannot be a key name: no host, a query, spaces or '+' (signed-note).
+func Origin(submissionURL string) (string, error) {
+	u, err := url.Parse(submissionURL)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("submission URL %q is not an http(s) URL with a host", submissionURL)
+	}
+	o := strings.TrimRight(u.Host+u.EscapedPath(), "/")
+	if strings.ContainsAny(o, " +") || strings.Contains(o, "%20") || strings.Contains(o, "%2B") {
+		return "", fmt.Errorf("submission URL %q gives an origin with a space or '+'", submissionURL)
+	}
+	return o, nil
 }
 
 // CurrentState returns the log's state name ("usable", "readonly", ...).
