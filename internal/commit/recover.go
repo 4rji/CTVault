@@ -269,13 +269,13 @@ func applyBatch(x *index.Index, reader *vault.Reader, o RecoverOptions, m Manife
 
 // removeInterruptedWrites deletes what a writer killed inside
 // fsutil.WriteFileAtomic leaves behind: ".<name>.tmp-<digits>" files in the
-// root (views.sql), state/ and its folders (intents, ID_FLOOR, heads, log
-// records, incidents) and each vault folder's dict/. Pebble's folder and
-// every other name are left alone. The writer lock excludes every other
-// writer of these folders.
+// root (views.sql), dataset/ (ACTIVE.json), state/ and its folders (intents,
+// ID_FLOOR, heads, log records, incidents) and each vault folder's dict/.
+// Pebble's folder and every other name are left alone. The writer lock
+// excludes every other writer of these folders.
 func removeInterruptedWrites(o RecoverOptions, r *Recovered) error {
 	root, state := o.Paths.Root, o.Paths.StateDir()
-	dirs := []string{root}
+	dirs := []string{root, filepath.Join(root, "dataset")}
 	err := filepath.WalkDir(state, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err

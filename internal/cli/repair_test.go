@@ -2,6 +2,8 @@ package cli
 
 import (
 	"crypto/sha256"
+	"fmt"
+	"github.com/4rji/ctvault/internal/derive"
 	"os"
 	"path/filepath"
 	"strings"
@@ -75,7 +77,7 @@ func TestRepairDerivedCommand(t *testing.T) {
 		t.Fatalf("repair with no flag: %s", e.stderr)
 	}
 	out := e.mustRun("--root", e.root, "repair", "--derived")
-	if !strings.Contains(out, "replaced "+ms[1].BatchID+"/certs.p1.parquet") || !strings.Contains(out, "checked 4 derived files in 2 batches; replaced 1") {
+	if !strings.Contains(out, "replaced "+ms[1].BatchID+"/certs.p1.parquet") || !strings.Contains(out, fmt.Sprintf("checked %d derived files in 2 batches; replaced 1", 2*len(derive.Builders))) {
 		t.Fatalf("repair --derived:\n%s", out)
 	}
 	e.mustRun("--root", e.root, "verify", "--full")

@@ -96,7 +96,7 @@ func TestEstimatePeak(t *testing.T) {
 // reviewed edit (A1 §8), the last one with Plan 4's live smoke test
 // (amendment A3 §7.4: measured Parquet 172-200 and Pebble 77 B/entry).
 func TestSeedsAreReviewed(t *testing.T) {
-	if SeedVaultBytesPerEntry != 840 || SeedParquetBytesPerEntry != 210 || SeedPebbleBytesPerEntry != 80 {
+	if SeedVaultBytesPerEntry != 840 || SeedParquetBytesPerEntry != 265 || SeedPebbleBytesPerEntry != 80 { // Parquet: + the D tables, amendment A7 §3
 		t.Fatalf("seeds vault %d, Parquet %d, Pebble %d", SeedVaultBytesPerEntry, SeedParquetBytesPerEntry, SeedPebbleBytesPerEntry)
 	}
 }

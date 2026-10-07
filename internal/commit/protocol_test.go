@@ -399,13 +399,14 @@ func TestRecoverRefusesAForeignSegment(t *testing.T) {
 // TestRecoverRemovesInterruptedAtomicWrites: a writer killed inside
 // fsutil.WriteFileAtomic leaves ".<name>.tmp-<n>" behind (found by the
 // random kill loop in state/intent). Recovery removes such leftovers from
-// the vault's metadata folders, leaves Pebble's folder and every other
-// name alone.
+// the vault's metadata folders and dataset/ (ACTIVE.json), leaves Pebble's
+// folder and every other name alone.
 func TestRecoverRemovesInterruptedAtomicWrites(t *testing.T) {
 	e := newEnv(t)
 	gone := []string{"state/intent/.fakelog__000000000080-000000000119.json.tmp-432468658", "state/.ID_FLOOR.tmp-1",
-		"state/heads/.fakelog.json.tmp-7", ".views.sql.tmp-99", "vault/dict/.1.dict.tmp-5"}
-	kept := []string{"state/notes.tmp", "state/pebble/.keep.tmp-3", "tmp/duckdb-1/.x.tmp-4", "state/.hidden"}
+		"state/heads/.fakelog.json.tmp-7", ".views.sql.tmp-99", "vault/dict/.1.dict.tmp-5",
+		"dataset/.ACTIVE.json.tmp-3385969005"} // found by the random kill loop with the D tables (A7)
+	kept := []string{"state/notes.tmp", "state/pebble/.keep.tmp-3", "tmp/duckdb-1/.x.tmp-4", "state/.hidden", "dataset/notes.tmp"}
 	for _, p := range append(slices.Clone(gone), kept...) {
 		os.MkdirAll(filepath.Dir(filepath.Join(e.p.Root, p)), 0o755)
 		os.WriteFile(filepath.Join(e.p.Root, p), []byte("x"), 0o644)

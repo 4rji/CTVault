@@ -3,6 +3,7 @@ package ingest
 import (
 	"bytes"
 	"errors"
+	"github.com/4rji/ctvault/internal/derive"
 	"os"
 	"path/filepath"
 	"strings"
@@ -101,7 +102,8 @@ func TestRepairDerived(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rep.Replaced) != 2 || len(rep.Damaged) != 0 || rep.Batches != 4 || rep.Checked != 7 {
+	// Every table's file in 4 batches, but the one removed.
+	if len(rep.Replaced) != 2 || len(rep.Damaged) != 0 || rep.Batches != 4 || rep.Checked != 4*len(derive.Builders)-1 {
 		t.Fatalf("report %+v", rep)
 	}
 	if !e.intact() {
@@ -114,11 +116,11 @@ func TestRepairDerived(t *testing.T) {
 		t.Fatalf("tmp/rebuild keeps %d entries", len(left))
 	}
 	rep, err = e.repair("", nil)
-	if err != nil || len(rep.Replaced) != 0 || len(rep.Damaged) != 0 || rep.Checked != 8 {
+	if err != nil || len(rep.Replaced) != 0 || len(rep.Damaged) != 0 || rep.Checked != 4*len(derive.Builders) {
 		t.Fatalf("a second run: %+v %v", rep, err)
 	}
 	// --batch: one batch only.
-	if rep, err := e.repair(e.ms[3].BatchID, nil); err != nil || rep.Batches != 1 || rep.Checked != 2 {
+	if rep, err := e.repair(e.ms[3].BatchID, nil); err != nil || rep.Batches != 1 || rep.Checked != len(derive.Builders) {
 		t.Fatalf("--batch: %+v %v", rep, err)
 	}
 	if _, err := e.repair("fakelog/999999999999-999999999999", nil); !errors.Is(err, ErrUnknownBatch) {

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/4rji/ctvault/internal/exitcode"
+	"github.com/4rji/ctvault/internal/extdecode"
 	"github.com/4rji/ctvault/internal/extract"
 	"github.com/4rji/ctvault/internal/leaf"
 )
@@ -17,6 +18,9 @@ func TestExplainError(t *testing.T) {
 		t.Fatalf("output: %q", out)
 	}
 	if out := e.mustRun("explain-error", "leaf_bad_version"); !strings.Contains(out, "leaf_bad_version (log entry error): ") {
+		t.Fatalf("output: %q", out)
+	}
+	if out := e.mustRun("explain-error", "ext_sct_list_malformed"); !strings.Contains(out, "ext_sct_list_malformed (certificate extension error): ") {
 		t.Fatalf("output: %q", out)
 	}
 	if code := e.run("explain-error", "no_such_code"); code != exitcode.Usage || !strings.Contains(e.stderr.String(), "unknown error code") {
@@ -51,6 +55,8 @@ func TestErrorCodesAreFrozen(t *testing.T) {
 			explained = extract.Code(code).Explain() != ""
 		case "leaf":
 			explained = leaf.Code(code).Explain() != ""
+		case "extdecode":
+			explained = extdecode.Code(code).Explain() != ""
 		}
 		if !ok || !explained {
 			t.Errorf("published code %q no longer exists", line)
@@ -65,6 +71,11 @@ func TestErrorCodesAreFrozen(t *testing.T) {
 	for _, c := range leaf.Codes {
 		if !listed["leaf "+string(c)] {
 			t.Errorf("new code %s: append \"leaf %s\" to testdata/error_codes.txt", c, c)
+		}
+	}
+	for _, c := range extdecode.Codes {
+		if !listed["extdecode "+string(c)] {
+			t.Errorf("new code %s: append \"extdecode %s\" to testdata/error_codes.txt", c, c)
 		}
 	}
 }

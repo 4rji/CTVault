@@ -1,5 +1,6 @@
-// Package derive builds the derived tables, certs and names, from extracted
-// certificates (spec §7.2-7.5, amendment A2 §4). A row depends only on the
+// Package derive builds the derived tables, certs, names and the D tables
+// (amendment A7), from extracted certificates (spec §7.2-7.5, amendment A2
+// §4). A row depends only on the
 // certificate's DER and its vault context, so the same batch always derives
 // the same rows, at ingest or in a later local rebuild.
 package derive
@@ -33,6 +34,7 @@ type Table struct {
 	Version int
 	Columns []Column
 	PSL     string // the public-suffix snapshot, for tables that use eTLD+1
+	Decoder string // the extension decoder, for the D tables (amendment A7 §3)
 }
 
 // File is the table's file name in a batch directory, e.g. certs.p1.parquet.
@@ -50,13 +52,17 @@ func (t Table) SchemaSHA256() string {
 // KV is the Parquet key-value metadata every file of the table carries
 // (spec §7.2), in a fixed order.
 func (t Table) KV() [][2]string {
-	return [][2]string{
+	kv := [][2]string{
 		{"ctvault.table", t.Name},
 		{"ctvault.version", strconv.Itoa(t.Version)},
 		{"ctvault.extractor", ExtractorVersion},
 		{"ctvault.schema_sha256", t.SchemaSHA256()},
 		{"ctvault.psl", t.PSL},
 	}
+	if t.Decoder != "" { // only the D tables: certs and names keep their bytes
+		kv = append(kv, [2]string{"ctvault.decoder", t.Decoder})
+	}
+	return kv
 }
 
 // Row is one row: values in the table's column order, nil for NULL.

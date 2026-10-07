@@ -51,10 +51,18 @@ the table is mixed meanwhile, and readers need --parser-version or
 				fmt.Fprintln(out, "nothing to rebuild: every derived table is complete")
 				return nil
 			}
-			fmt.Fprintf(out, "rebuilt %d batches; %s %s complete\n", st.Batches, strings.Join(tables, " and "), isAre(len(tables)))
+			fmt.Fprintf(out, "rebuilt %d batches; %s %s complete\n", st.Batches, andList(tables), isAre(len(tables)))
 			return nil
 		},
 	}
 	cmd.Flags().BoolVar(&inPlace, "in-place", false, "replace each batch's old version as it goes, when the disk cannot hold both")
 	return cmd
+}
+
+// andList joins words as a sentence does: "a", "a and b", "a, b and c".
+func andList(w []string) string {
+	if len(w) <= 1 {
+		return strings.Join(w, "")
+	}
+	return strings.Join(w[:len(w)-1], ", ") + " and " + w[len(w)-1]
 }

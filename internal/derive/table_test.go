@@ -38,6 +38,14 @@ func TestSchemasAreFrozen(t *testing.T) {
 	for name, want := range map[string]string{
 		CertsV1.Name: "ced48dafaee44fa963d3b3bda2d7fbfe781753b28440c828cc039393fc859b17",
 		NamesV1.Name: "82bd317eaa88ed33cfdbd8f825743fe3f4b3ca3d9b376b5016722d5ee8eb0f96",
+		// The D tables (amendment A7).
+		CertExtensionsV1.Name: "e3faaba7de077fdd1deeb6d5e8c0efa3c686abf218b1170f4ebcefa66a336917",
+		CertPoliciesV1.Name:   "53d3e1b78e27903f39bfc6337a3908af3fd9aee6d18c2a4c3c5f0c88d2e55aae",
+		CertEKUsV1.Name:       "e7a2c7b6b2be622b45b0dfa6c7c52a97b6d26077627ed14848006c134e060b28",
+		CertKeyUsageV1.Name:   "02823724583241024651c2d7ecef872bd56657b48dd40d35859b7dd9619b9635",
+		CertAIAV1.Name:        "f0aac3da0c51a6c63d4f7cc28bfd883376764125642b07f53c0cf6ba80ea5e06",
+		CertCRLDPsV1.Name:     "7ac14830cc3b426507d1ed2974400dbd240ff3df87747f28e854be79363fe874",
+		CertSCTsV1.Name:       "743497eebbddb490a71a43f84948fc691e4ffec7c582770ab86106e08b2c635d",
 	} {
 		for _, b := range Builders {
 			if b.Table().Name == name && b.Table().SchemaSHA256() != want {

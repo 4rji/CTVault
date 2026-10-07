@@ -4,6 +4,7 @@
 package derivetest
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/4rji/ctvault/internal/derive"
@@ -48,9 +49,21 @@ func (Flags) Build(_ *extract.Cert, ctx derive.Context) []derive.Row {
 // Registries name the test registries, for crash children that set theirs
 // from their configuration.
 var Registries = map[string][]derive.Versions{
-	"v2":        {{Current: CertsV2{}, Previous: derive.Certs{}}, {Current: derive.Names{}}},
-	"v2-only":   {{Current: CertsV2{}}, {Current: derive.Names{}}},
-	"new-table": {{Current: derive.Certs{}}, {Current: derive.Names{}}, {Current: Flags{}}},
+	"v2":        withCerts(derive.Versions{Current: CertsV2{}, Previous: derive.Certs{}}),
+	"v2-only":   withCerts(derive.Versions{Current: CertsV2{}}),
+	"new-table": withCerts(derive.Versions{Current: derive.Certs{}}, derive.Versions{Current: Flags{}}),
+}
+
+// withCerts is the binary's own registry, the D tables included, with certs
+// replaced and extra tables appended.
+func withCerts(certs derive.Versions, extra ...derive.Versions) []derive.Versions {
+	r := slices.Clone(derive.Registry)
+	for i, v := range r {
+		if v.Current.Table().Name == "certs" {
+			r[i] = certs
+		}
+	}
+	return append(r, extra...)
 }
 
 // Use makes the binary carry a test registry until the test ends.

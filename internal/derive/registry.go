@@ -9,7 +9,9 @@ type Versions struct {
 }
 
 // Registry is this binary's tables, in a fixed order.
-var Registry = []Versions{{Current: Certs{}}, {Current: Names{}}}
+var Registry = []Versions{{Current: Certs{}}, {Current: Names{}},
+	{Current: CertExtensions{}}, {Current: CertPolicies{}}, {Current: CertEKUs{}}, {Current: CertKeyUsage{}},
+	{Current: CertAIA{}}, {Current: CertCRLDPs{}}, {Current: CertSCTs{}}}
 
 func current(r []Versions) []Builder {
 	out := make([]Builder, len(r))

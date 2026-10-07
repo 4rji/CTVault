@@ -42,3 +42,11 @@ extract ski_unreadable
 extract signature_unreadable
 extract tbs_extra_fields
 leaf leaf_index_mismatch
+extdecode ext_policies_malformed
+extdecode ext_eku_malformed
+extdecode ext_key_usage_malformed
+extdecode ext_basic_constraints_malformed
+extdecode ext_aia_malformed
+extdecode ext_crl_dps_malformed
+extdecode ext_sct_list_malformed
+extdecode ext_duplicate

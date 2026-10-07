@@ -3,6 +3,7 @@
 package measure
 
 import (
+	"bytes"
 	"context"
 	"crypto/x509"
 	"encoding/base64"
@@ -205,9 +206,16 @@ func TestMeasureRepresentative(t *testing.T) {
 	s := fakeSample(t, es, sample.Representative, 24, 48)
 	o := options(t, t.TempDir())
 	o.BatchSize = 16
+	var out bytes.Buffer
+	o.Out = &out
 	r, _, err := Run(context.Background(), s, o)
 	if err != nil {
 		t.Fatal(err)
+	}
+	// The workspace starts mid-log, which the read path refuses, so the
+	// post-commit audit is off for it rather than failing every batch.
+	if strings.Contains(out.String(), "post-commit audit") {
+		t.Fatalf("the audit ran on a workspace that starts mid-log:\n%s", out.String())
 	}
 	if r.Sample.Kind != "representative" || r.Sample.Start != 24 || len(r.Batches) != 3 || r.Batches[0].First != 24 || r.Batches[2].Last != 71 {
 		t.Fatalf("sample %+v, batches %+v", r.Sample, r.Batches)

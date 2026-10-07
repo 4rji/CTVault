@@ -16,7 +16,19 @@ import (
 	"github.com/4rji/ctvault/internal/extract"
 )
 
-var update = flag.Bool("update", false, "rewrite testdata/corpus_rows.golden.zst")
+var update = flag.Bool("update", false, "rewrite the corpus golden files in testdata")
+
+// goldens are the corpus golden files and the tables each holds: certs and
+// names in the file they always had, so adding a table leaves it byte for
+// byte (amendment A7 §4.4), and the D tables in their own.
+var goldens = []struct {
+	file   string
+	tables map[string]bool
+}{
+	{"corpus_rows.golden.zst", map[string]bool{"certs": true, "names": true}},
+	{"corpus_d_rows.golden.zst", map[string]bool{"cert_extensions": true, "cert_policies": true, "cert_ekus": true,
+		"cert_key_usage": true, "cert_aia": true, "cert_crl_dps": true, "cert_scts": true}},
+}
 
 // realCorpus reads the extractor's corpus of real certificates: 2,000
 // leaves, then 710 chain certificates.
@@ -42,11 +54,12 @@ func realCorpus(t *testing.T) [][]byte {
 }
 
 // TestCorpusRowsGolden: every builder's rows for the real corpus match the
-// golden file, so a change to the extractor, the normalization or the
-// public-suffix list shows up here and must bump a table version.
+// golden files, so a change to the extractor, the decoders, the
+// normalization or the public-suffix list shows up here and must bump a
+// table version.
 func TestCorpusRowsGolden(t *testing.T) {
 	certs := realCorpus(t)
-	var lines []string
+	lines := make([][]string, len(goldens))
 	stats := map[string]int{}
 	for i, der := range certs {
 		c := extract.Parse(der)
@@ -64,7 +77,16 @@ func TestCorpusRowsGolden(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				lines = append(lines, b.Table().Name+" "+string(line))
+				placed := false
+				for g := range goldens {
+					if goldens[g].tables[b.Table().Name] {
+						lines[g] = append(lines[g], b.Table().Name+" "+string(line))
+						placed = true
+					}
+				}
+				if !placed {
+					t.Fatalf("table %s is in no golden file", b.Table().Name)
+				}
 				stats[b.Table().Name]++
 				if b.Table().Name == "names" && r[3] == true {
 					stats["names dns_valid"]++
@@ -73,8 +95,13 @@ func TestCorpusRowsGolden(t *testing.T) {
 		}
 	}
 	t.Logf("%d certificates: %v", len(certs), stats)
-	got := []byte(strings.Join(lines, "\n") + "\n")
-	path := filepath.Join("testdata", "corpus_rows.golden.zst")
+	for g, gold := range goldens {
+		checkGolden(t, filepath.Join("testdata", gold.file), []byte(strings.Join(lines[g], "\n")+"\n"))
+	}
+}
+
+func checkGolden(t *testing.T, path string, got []byte) {
+	t.Helper()
 	if *update {
 		enc, _ := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedBestCompression), zstd.WithEncoderConcurrency(1))
 		if err := os.MkdirAll("testdata", 0o755); err != nil {
@@ -99,9 +126,9 @@ func TestCorpusRowsGolden(t *testing.T) {
 		g, w := strings.Split(string(got), "\n"), strings.Split(string(want), "\n")
 		for i := range min(len(g), len(w)) {
 			if g[i] != w[i] {
-				t.Fatalf("line %d differs:\n got  %s\n want %s", i+1, g[i], w[i])
+				t.Fatalf("%s line %d differs:\n got  %s\n want %s", path, i+1, g[i], w[i])
 			}
 		}
-		t.Fatalf("%d lines, want %d", len(g), len(w))
+		t.Fatalf("%s: %d lines, want %d", path, len(g), len(w))
 	}
 }

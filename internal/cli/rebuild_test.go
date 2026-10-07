@@ -30,7 +30,7 @@ func TestRebuildCommand(t *testing.T) {
 		t.Fatalf("update on a building vault warns: %q", msg)
 	}
 	out := e.mustRun("--root", e.root, "rebuild")
-	if a, _, _ := derive.ReadActive(e.root); !a.AllComplete() || !strings.Contains(out, "certs and names are complete") {
+	if a, _, _ := derive.ReadActive(e.root); !a.AllComplete() || !strings.Contains(out, "certs, names, cert_extensions, cert_policies, cert_ekus, cert_key_usage, cert_aia, cert_crl_dps and cert_scts are complete") {
 		t.Fatalf("rebuild: %+v\n%s", a, out)
 	}
 	e.mustRun("--root", e.root, "update")

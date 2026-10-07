@@ -148,6 +148,13 @@ func (c *Cert) parseSAN(v cryptobyte.String) {
 // asciiDisplay renders an IA5String: bytes outside ASCII and control
 // characters become \XX, and a backslash is doubled. ok is false when a
 // byte is outside ASCII.
+// Display renders bytes from a certificate as the extractor renders DNS
+// names: bytes outside printable ASCII as \XX, and a backslash doubled.
+func Display(b []byte) string {
+	s, _ := asciiDisplay(b)
+	return s
+}
+
 func asciiDisplay(b []byte) (string, bool) {
 	ok := true
 	var s strings.Builder

@@ -138,10 +138,10 @@ func (g Guard) fits(path string, u Usage, need uint64) error {
 // §10.1). Reviewed with Plan 4's live smoke test (amendment A3 §7.4):
 // Parquet now includes certs and names (measured 172-200), Pebble measured
 // 77 over a million live entries; the vault seed covers 561-733 with a
-// dictionary.
+// dictionary. Amendment A7 adds the D tables' measured 53-57 to Parquet.
 const (
 	SeedVaultBytesPerEntry   = 840
-	SeedParquetBytesPerEntry = 210
+	SeedParquetBytesPerEntry = 265
 	SeedPebbleBytesPerEntry  = 80
 	MinHistory               = 20
 

@@ -93,5 +93,5 @@ A6's 22 decisions are as approved; final review: a self-review (no fresh reviewe
   - issuers kept across runs;
   - pruned logs.
 - **The live smoke run (A6 §7.7) has not run yet.** It waits for your go-ahead.
-- **A measurement workspace's post-commit audit warns on every batch** that the batches "are not contiguous at index 0". It predates A6: the Argon representative sample does the same. The workspace starts mid-log by design (A1 §2.6), and Plan 4's audit does not expect that. It is dev-only and changes no data. A fix would skip the audit, or tolerate the seeded start, in measurement workspaces.
+- **Fixed after the summary (2026-10-07): measurement runs no longer warn on every batch.** A representative sample's workspace starts mid-log (A1 §2.6), and Plan 4's post-commit audit could only fail on it, as it did for Argon samples before A6. `measure` now turns the audit off for representative samples only. `TestMeasureRepresentative` went RED, then GREEN, and a real re-measurement of the Argon window gives 0 warnings.
 - **Real-data folders:** the samples live under `~/.cache/ctvault-dev/samples/` (about 177 MB), and the shared dev vault is `~/.cache/ctvault-dev/vaults/a6mixed`.

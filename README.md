@@ -3,9 +3,10 @@
 A local, cryptographically verified Certificate Transparency research archive.
 Design: `docs/superpowers/specs/2026-10-04-ctvault-design.md`.
 
-**Status:** tiled logs (amendment A6): static-ct-api logs are pinned,
-ingested, followed and verified like RFC 6962 logs, in the same vault. This
-builds on Plan 6: 6C (the power-loss gate, passing), 6B (version transitions:
+**Status:** D fields (amendment A7): seven tables of certificate
+policies and extensions, built from the vault. Before that, tiled logs
+(amendment A6): static-ct-api logs are pinned, ingested, followed and
+verified like RFC 6962 logs, in the same vault. This builds on Plan 6: 6C (the power-loss gate, passing), 6B (version transitions:
 upgrades in turns, `gc`, `rebuild --in-place`) and 6A (`verify`, `repair`);
 Plan 5 (`explore`, the terminal UI) and Plan 4 (the read path: `search`,
 `fetch`, export, the post-commit audit).
@@ -160,6 +161,34 @@ duckdb -c ".read /mnt/ctvault/views.sql" -c "SELECT count(*) FROM entries"
 duckdb -c ".read /mnt/ctvault/views.sql" -c "SELECT c.issuer_cn, c.not_before FROM names n JOIN certs c USING (cert_id) WHERE n.etld1 = 'example.com'"
 duckdb -c ".read /mnt/ctvault/views.sql" -c "SELECT median(logging_delay) FROM logging_delay"
 ```
+
+**Policies and extensions (area D, amendment A7)** have seven tables, one or
+more rows per certificate, joined on `cert_id`:
+
+| Table | Holds |
+|---|---|
+| `cert_extensions` | every extension: OID, critical, length, and a `decode_error` when D could not decode it |
+| `cert_policies` | policy OIDs, with `validation` (`dv`, `ov`, `iv`, `ev`) and the first CPS URI |
+| `cert_ekus` | extended key usages, with short names (`server_auth`, `client_auth`, ...) |
+| `cert_key_usage` | the nine keyUsage bits, `is_ca` and `path_len` |
+| `cert_aia` | OCSP and caIssuers URLs |
+| `cert_crl_dps` | CRL distribution point URLs |
+| `cert_scts` | embedded SCTs: log ID, timestamp, algorithms |
+
+```bash
+# The share of certificates per log that still carry an OCSP URL.
+duckdb -c ".read /mnt/ctvault/views.sql" -c "SELECT log, avg((EXISTS (SELECT 1 FROM cert_aia a WHERE a.cert_id = e.cert_id AND a.method = 'ocsp'))::INT) FROM entries e GROUP BY 1"
+# Leaf certificates that still allow clientAuth.
+duckdb -c ".read /mnt/ctvault/views.sql" -c "SELECT count(DISTINCT cert_id) FROM cert_ekus JOIN certs USING (cert_id) WHERE eku_name = 'client_auth' AND kind <> 'chain'"
+```
+
+- They add about 56 B per entry, measured on 151,200 real entries; SCTs are
+  the largest part.
+- An extension that does not decode gives no rows, only its code in
+  `cert_extensions` (`ctvault explain-error ext_policies_malformed`).
+- A vault written before them builds them in turns during `update`, or all
+  at once with `ctvault rebuild`. The views show `<table>_building` until
+  then.
 
 **New table versions are built from the vault**, never downloaded again:
 - **A vault written before Plan 3, or a new table:** the views show it only as

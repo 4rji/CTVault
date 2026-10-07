@@ -51,7 +51,7 @@ func TestActiveCheck(t *testing.T) {
 	two := 2
 	for name, edit := range map[string]func(*Active){
 		"unknown version": func(a *Active) { s := a.Tables["certs"]; s.Active = &two; a.Tables["certs"] = s },
-		"unknown table":   func(a *Active) { a.Tables["cert_policies"] = a.Tables["certs"] },
+		"unknown table":   func(a *Active) { a.Tables["cert_name_constraints"] = a.Tables["certs"] },
 		"missing table":   func(a *Active) { delete(a.Tables, "names") },
 		"unknown status":  func(a *Active) { s := a.Tables["names"]; s.Status = "mixed"; a.Tables["names"] = s },
 		"nothing active or building": func(a *Active) {

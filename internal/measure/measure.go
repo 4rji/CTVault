@@ -263,6 +263,12 @@ func ingestAll(ctx context.Context, s *sample.Sample, o Options, ws string, sv *
 	}
 
 	cfg := config.Default()
+	if s.Manifest.Kind == sample.Representative {
+		// The workspace starts mid-log (amendment A1 §2.6), which the read
+		// path rightly refuses, so the post-commit audit could only fail.
+		// Canonical measurements keep it, to time batches as production.
+		cfg.Ingest.PostCommitAudit = false
+	}
 	var id [16]byte
 	if _, err := rand.Read(id[:]); err != nil {
 		return nil, err
