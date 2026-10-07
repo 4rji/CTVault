@@ -74,6 +74,7 @@ func newSearchCmd(a *app) *cobra.Command {
 
 func newSearchCommand(a *app) (*cobra.Command, *searchFlags) {
 	sf := &searchFlags{}
+	var mixed query.MixedRead
 	var format, output string
 	var force bool
 	cmd := &cobra.Command{
@@ -94,7 +95,7 @@ func newSearchCommand(a *app) (*cobra.Command, *searchFlags) {
 			if !c.Flags().Changed("limit") && format == "table" && output == "" {
 				q.Limit = 100
 			}
-			r, err := a.openReader(c, q.AsOf)
+			r, err := a.openReader(c, q.AsOf, mixed)
 			if err != nil {
 				return err
 			}
@@ -141,6 +142,7 @@ func newSearchCommand(a *app) (*cobra.Command, *searchFlags) {
 	f.StringVar(&output, "output", "", "export to this file, with the metadata that reproduces it")
 	f.BoolVar(&force, "force", false, "replace an existing --output file")
 	f.Uint64Var(&q.AsOf, "as-of", 0, "search the committed snapshot as of this commit_seq")
+	mixedFlags(cmd, &mixed)
 	return cmd, sf
 }
 

@@ -26,7 +26,7 @@ func TestRebuildCommand(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.mustRun("--root", e.root, "update")
-	if msg := e.stderr.String(); !strings.Contains(msg, "certs and names are being built: run `ctvault rebuild`") {
+	if msg := e.stderr.String(); !strings.Contains(msg, "certs v1 is being built (2 of 2 batches have it)") || !strings.Contains(msg, "names v1 is being built") || !strings.Contains(msg, "`ctvault rebuild` finishes it now") {
 		t.Fatalf("update on a building vault warns: %q", msg)
 	}
 	out := e.mustRun("--root", e.root, "rebuild")

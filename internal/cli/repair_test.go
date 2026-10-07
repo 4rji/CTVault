@@ -2,11 +2,14 @@ package cli
 
 import (
 	"crypto/sha256"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/4rji/ctvault/internal/commit"
 	"github.com/4rji/ctvault/internal/ctlogtest"
+	"github.com/4rji/ctvault/internal/dataset"
 	"github.com/4rji/ctvault/internal/exitcode"
 	"github.com/4rji/ctvault/internal/index"
 )
@@ -28,9 +31,6 @@ func TestRepairReindex(t *testing.T) {
 	b.Close()
 	x.Close()
 
-	if code := e.run("--root", e.root, "repair"); code != exitcode.Usage {
-		t.Fatalf("repair without --reindex: exit %d", code)
-	}
 	out := e.mustRun("--root", e.root, "repair", "--reindex")
 	if !strings.Contains(out, "rebuilt the index from 2 batches") {
 		t.Fatalf("repair --reindex: %s", out)
@@ -46,5 +46,43 @@ func TestRepairReindex(t *testing.T) {
 	}
 	if out := e.mustRun("--root", e.root, "update"); !strings.Contains(out, "up to date") {
 		t.Fatalf("update after the repair: %s", out)
+	}
+}
+
+// TestRepairDerivedCommand: repair --derived rebuilds a damaged certs file,
+// after which verify --full passes; damaged source data is refused with
+// exit 5; repair needs exactly one of --reindex and --derived (amendment A5
+// §3.2-3.4).
+func TestRepairDerivedCommand(t *testing.T) {
+	e, _ := updateEnv(t, 80, ctlogtest.Options{})
+	e.mustRun("--root", e.root, "update")
+	ms := committed(t, e.root)
+	flip := func(m commit.Manifest, name string) {
+		p := filepath.Join(commit.Paths{Root: e.root}.BatchDir(m.ID()), name)
+		b, _ := os.ReadFile(p)
+		b[len(b)/2] ^= 0xff
+		os.WriteFile(p, b, 0o644)
+	}
+	flip(ms[1], "certs.p1.parquet")
+
+	for _, args := range [][]string{{"repair"}, {"repair", "--reindex", "--derived"}, {"repair", "--batch", ms[1].BatchID},
+		{"repair", "--derived", "--batch", "fakelog/000000000999-000000000999"}} {
+		if code := e.run(append([]string{"--root", e.root}, args...)...); code != exitcode.Usage {
+			t.Errorf("%v: exit %d, want %d", args, code, exitcode.Usage)
+		}
+	}
+	if e.run("--root", e.root, "repair"); !strings.Contains(e.stderr.String(), "--derived") || !strings.Contains(e.stderr.String(), "verify") {
+		t.Fatalf("repair with no flag: %s", e.stderr)
+	}
+	out := e.mustRun("--root", e.root, "repair", "--derived")
+	if !strings.Contains(out, "replaced "+ms[1].BatchID+"/certs.p1.parquet") || !strings.Contains(out, "checked 4 derived files in 2 batches; replaced 1") {
+		t.Fatalf("repair --derived:\n%s", out)
+	}
+	e.mustRun("--root", e.root, "verify", "--full")
+
+	flip(ms[0], dataset.EntriesFile)
+	flip(ms[0], "names.p1.parquet")
+	if code := e.run("--root", e.root, "repair", "--derived"); code != exitcode.Verification || !strings.Contains(e.stdout.String(), "backup") {
+		t.Fatalf("damaged source data: exit %d\n%s\n%s", code, e.stdout, e.stderr)
 	}
 }

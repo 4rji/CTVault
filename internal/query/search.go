@@ -251,24 +251,37 @@ func SearchPage(ctx context.Context, s *Snapshot, sess *Session, vaultDirs []str
 	return p, nil
 }
 
-func run(ctx context.Context, s *Snapshot, sess *Session, vaultDirs []string, q *Query, after *Cursor, limit int, fn func(cols []string, row []any, c Cursor) error) error {
+// rowFunc receives a search's rows in order, with each row's cursor.
+type rowFunc func(cols []string, row []any, c Cursor) error
+
+// compiled is a search as SQL: a WITH clause and the group's rows, one
+// column per group column. body is "" when no row can match.
+type compiled struct {
+	g          group
+	with, body string
+}
+
+// compile normalizes q and builds its SQL. It reads the names files to
+// find the matched cert_ids it prunes with (amendment A3 §7.1).
+func compile(ctx context.Context, s *Snapshot, sess *Session, vaultDirs []string, q *Query) (compiled, error) {
 	g, err := q.normalize()
 	if err != nil {
-		return err
+		return compiled{}, err
 	}
 	pred, err := q.namePredicate()
 	if err != nil {
-		return err
+		return compiled{}, err
 	}
-	for _, t := range []derive.Table{derive.CertsV1, derive.NamesV1} {
-		if err := s.Ready(t); err != nil {
-			return err
+	for _, t := range []string{"certs", "names"} {
+		if _, err := s.Table(t); err != nil {
+			return compiled{}, err
 		}
 	}
-	names, certs := s.Files(derive.NamesV1.File()), s.Files(derive.CertsV1.File())
+	none := compiled{g: g}
+	names, certs := s.TableFiles("names"), s.TableFiles("certs")
 	entries, chains := s.Files(dataset.EntriesFile), s.Files(dataset.ChainsFile)
 	if len(names) == 0 || len(entries) == 0 {
-		return nil // nothing committed
+		return none, nil // nothing committed
 	}
 
 	nameWhere := pred
@@ -313,23 +326,23 @@ func run(ctx context.Context, s *Snapshot, sess *Session, vaultDirs []string, q 
 	if q.IssuedBy != "" {
 		p, err := issuedBy(ctx, s, sess, vaultDirs, q.IssuedBy, entries, chains)
 		if err != nil {
-			return err
+			return compiled{}, err
 		}
 		certWhere = append(certWhere, p)
 	}
 	// Prune with the matched cert_ids (amendment A3 §7.1): only the batches
 	// whose cert_id_range holds one can hold its certs row, and only those
 	// batches and later ones can hold an entry that references it.
-	ids, err := matchedCertIDs(ctx, sess, names, nameWhere)
+	ids, err := matchedCertIDs(ctx, sess, fileList(names)+s.unionOpt("names"), nameWhere)
 	if err != nil {
-		return err
+		return compiled{}, err
 	}
 	if len(ids) == 0 {
-		return nil
+		return none, nil
 	}
 	certs, entries = s.filesFor(ids)
 	if len(certs) == 0 {
-		return nil
+		return none, nil
 	}
 	idFilter := "cert_id IN (SELECT cert_id FROM n)"
 	if len(ids) <= maxLiteralIDs {
@@ -354,7 +367,7 @@ c AS (SELECT cert_id, sha256, kind, issuer_cn, not_before, not_after, n_dns_name
       FROM read_parquet(%s) WHERE %s),
 e AS (SELECT cert_id, min(ct_ts) AS first_seen, max(ct_ts) AS last_seen, list_sort(list_distinct(list(log))) AS logs
       FROM read_parquet(%s, hive_partitioning = true) WHERE %s%s GROUP BY cert_id)`,
-		fileList(names), nameWhere, fileList(certs), strings.Join(certWhere, " AND "), fileList(entries), idFilter, eFilter)
+		fileList(names)+s.unionOpt("names"), nameWhere, fileList(certs)+s.unionOpt("certs"), strings.Join(certWhere, " AND "), fileList(entries), idFilter, eFilter)
 	var body string
 	switch q.Group {
 	case "names":
@@ -373,40 +386,70 @@ ei AS (SELECT issuance_key, cert_id, entry_type, ct_ts FROM read_parquet(%s, hiv
        list_slice(list_sort(list_distinct(list(c.issuer_cn))), 1, 5) AS issuers
 FROM ei JOIN c USING (cert_id) GROUP BY ei.issuance_key`
 	}
-	f := strings.Fields(q.Sort)
-	desc := len(f) == 2 && f[1] == "desc"
-	order := "__ctv_sort"
-	if desc {
-		order += " DESC"
+	return compiled{g: g, with: with, body: body}, nil
+}
+
+func run(ctx context.Context, s *Snapshot, sess *Session, vaultDirs []string, q *Query, after *Cursor, limit int, fn rowFunc) error {
+	c, err := compile(ctx, s, sess, vaultDirs, q)
+	if err != nil || c.body == "" {
+		return err
 	}
-	order += " NULLS LAST, __ctv_tie"
+	g := c.g
+	sort, desc := sortOf(q)
 	cols := q.Columns()
 	var outer []string
 	if q.Filter != "" {
-		cast := make([]string, len(cols))
-		for i, c := range cols {
-			cast[i] = "CAST(" + c + " AS VARCHAR)"
-		}
-		outer = append(outer, "strpos(lower(concat_ws(' ', "+strings.Join(cast, ", ")+")), "+quote(strings.ToLower(q.Filter))+") > 0")
+		outer = append(outer, filterPredicate(cols, q.Filter))
 	}
 	if after != nil {
-		outer = append(outer, keyset(f[0], g.tiebreak, desc, *after))
+		outer = append(outer, keyset(sort, g.tiebreak, desc, *after))
 	}
-	sql := with + "\nSELECT " + strings.Join(cols, ", ") + ", " + f[0] + " AS __ctv_sort, " + g.tiebreak + " AS __ctv_tie FROM (" + body + ") AS g"
+	sql := c.with + "\nSELECT " + strings.Join(cols, ", ") + ", " + sort + " AS __ctv_sort, " + g.tiebreak + " AS __ctv_tie FROM (" + c.body + ") AS g"
 	if len(outer) > 0 {
 		sql += " WHERE " + strings.Join(outer, " AND ")
 	}
-	sql += " ORDER BY " + order
+	sql += " ORDER BY " + orderBy("__ctv_sort", desc, "__ctv_tie")
 	if limit > 0 {
 		sql += " LIMIT " + strconv.Itoa(limit)
 	}
+	return scanRows(ctx, sess, sql, len(cols), cols, fn)
+}
+
+// sortOf is a normalized query's sort column and direction.
+func sortOf(q *Query) (col string, desc bool) {
+	f := strings.Fields(q.Sort)
+	return f[0], len(f) == 2 && f[1] == "desc"
+}
+
+// orderBy is every search's order: the sort, NULLs last, then the unique
+// tie-breaker.
+func orderBy(sort string, desc bool, tie string) string {
+	if desc {
+		sort += " DESC"
+	}
+	return sort + " NULLS LAST, " + tie
+}
+
+// filterPredicate is explore's /: a case-insensitive text match over the
+// displayed columns (amendment A4 §3).
+func filterPredicate(cols []string, text string) string {
+	cast := make([]string, len(cols))
+	for i, c := range cols {
+		cast[i] = "CAST(" + c + " AS VARCHAR)"
+	}
+	return "strpos(lower(concat_ws(' ', " + strings.Join(cast, ", ") + ")), " + quote(strings.ToLower(text)) + ") > 0"
+}
+
+// scanRows runs sql, whose columns are cols then the sort key and the
+// tie-breaker, and calls fn for every row.
+func scanRows(ctx context.Context, sess *Session, sql string, n int, cols []string, fn rowFunc) error {
 	rows, err := sess.db.QueryContext(ctx, sql)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	for rows.Next() {
-		vals := make([]any, len(cols)+2)
+		vals := make([]any, n+2)
 		ptrs := make([]any, len(vals))
 		for i := range vals {
 			ptrs[i] = &vals[i]
@@ -414,7 +457,6 @@ FROM ei JOIN c USING (cert_id) GROUP BY ei.issuance_key`
 		if err := rows.Scan(ptrs...); err != nil {
 			return err
 		}
-		n := len(cols)
 		if err := fn(cols, vals[:n:n], Cursor{Sort: vals[n], Tie: vals[n+1]}); err != nil {
 			return err
 		}
@@ -506,8 +548,8 @@ const maxLiteralIDs = 1000
 
 // matchedCertIDs returns the distinct cert_ids of the names rows that
 // match, sorted.
-func matchedCertIDs(ctx context.Context, sess *Session, names []string, where string) ([]uint64, error) {
-	rows, err := sess.db.QueryContext(ctx, `SELECT DISTINCT cert_id FROM read_parquet(`+fileList(names)+`) WHERE `+where+` ORDER BY 1`)
+func matchedCertIDs(ctx context.Context, sess *Session, names, where string) ([]uint64, error) {
+	rows, err := sess.db.QueryContext(ctx, `SELECT DISTINCT cert_id FROM read_parquet(`+names+`) WHERE `+where+` ORDER BY 1`)
 	if err != nil {
 		return nil, err
 	}
@@ -535,7 +577,9 @@ func (s *Snapshot) filesFor(ids []uint64) (certs, entries []string) {
 			continue
 		}
 		if j, _ := slices.BinarySearch(ids, r[0]); j < len(ids) && ids[j] <= r[1] {
-			certs = append(certs, filepath.Join(p.BatchDir(m.ID()), derive.CertsV1.File()))
+			if f, ok := s.batchFile(m, "certs"); ok {
+				certs = append(certs, filepath.Join(p.BatchDir(m.ID()), f))
+			}
 			if first < 0 {
 				first = i
 			}

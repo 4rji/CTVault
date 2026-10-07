@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 
 	"github.com/4rji/ctvault/internal/commit"
-	"github.com/4rji/ctvault/internal/derive"
 	"github.com/4rji/ctvault/internal/health"
 	"github.com/4rji/ctvault/internal/query"
 )
@@ -51,8 +50,13 @@ func (w *Writer) runAudit(ctx context.Context, m commit.Manifest, add func(check
 		add("snapshot", "%v", err)
 		return
 	}
-	if snap.Ready(derive.CertsV1) != nil || snap.Ready(derive.NamesV1) != nil {
-		return // the tables are being built: nothing to look up yet
+	certs, err := snap.Table("certs")
+	if err != nil {
+		return // being built or mixed: nothing to look up yet
+	}
+	names, err := snap.Table("names")
+	if err != nil {
+		return
 	}
 	sess := query.SessionOn(w.stager.DB())
 	f, err := query.NewFetcher(snap, sess, w.o.VaultDirs)
@@ -65,7 +69,7 @@ func (w *Writer) runAudit(ctx context.Context, m commit.Manifest, add func(check
 	db := w.stager.DB()
 
 	rows, err := db.QueryContext(ctx, fmt.Sprintf(`SELECT sha256, cert_id FROM read_parquet('%s') ORDER BY sha256 LIMIT %d`,
-		filepath.Join(dir, derive.CertsV1.File()), auditCerts))
+		filepath.Join(dir, certs.File()), auditCerts))
 	if err != nil {
 		add("sha256", "reading the batch's certs: %v", err)
 	} else {
@@ -88,7 +92,7 @@ func (w *Writer) runAudit(ctx context.Context, m commit.Manifest, add func(check
 	w.hook(HookDuringAudit)
 
 	nrows, err := db.QueryContext(ctx, fmt.Sprintf(`SELECT name, etld1 FROM read_parquet('%s') WHERE dns_valid ORDER BY name LIMIT %d`,
-		filepath.Join(dir, derive.NamesV1.File()), auditNames))
+		filepath.Join(dir, names.File()), auditNames))
 	if err != nil {
 		add("name", "reading the batch's names: %v", err)
 	} else {

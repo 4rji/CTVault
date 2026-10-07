@@ -34,14 +34,14 @@ func TestSnapshot(t *testing.T) {
 	if s2, _ := Open(v.root, 0); len(s2.Files("certs.p2.parquet")) != 0 {
 		t.Fatal("an unlisted file entered the snapshot")
 	}
-	if err := s.Ready(derive.CertsV1); err != nil {
-		t.Fatal(err)
+	if tb, err := s.Table("certs"); err != nil || tb.File() != "certs.p1.parquet" {
+		t.Fatal(tb, err)
 	}
 	if err := derive.WriteActive(v.root, derive.Upgrading()); err != nil {
 		t.Fatal(err)
 	}
 	s3, _ := Open(v.root, 0)
-	if err := s3.Ready(derive.CertsV1); !errors.Is(err, ErrBuilding) {
+	if _, err := s3.Table("certs"); !errors.Is(err, ErrBuilding) {
 		t.Fatalf("certs being built: %v", err)
 	}
 }

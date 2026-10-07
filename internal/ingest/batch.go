@@ -501,7 +501,11 @@ func (w *Writer) verify(b *batch, sth logsource.SignedHead, end uint64) (commit.
 	if err := merkle.VerifyConsistency(end, sth.TreeSize, root, sth.RootHash, proof); err != nil {
 		return commit.Verified{}, errRetry{err: err, before: b.before, root: root, end: end, proof: proof}
 	}
-	return commit.Verified{Method: "consistency_proof", ProofNodes: len(proof)}, nil
+	nodes := make([]string, len(proof))
+	for i, n := range proof {
+		nodes[i] = hex.EncodeToString(n[:])
+	}
+	return commit.Verified{Method: "consistency_proof", ProofNodes: len(proof), Proof: nodes}, nil
 }
 
 // canary is P6: the staged files, and vault reads of sampled new records.
@@ -655,18 +659,19 @@ func (w *Writer) incident(id commit.BatchID, sth logsource.SignedHead, first, se
 	return dir, fsutil.WriteFileAtomic(filepath.Join(dir, "incident.json"), b, 0o644)
 }
 
-// builders are the builders whose table ACTIVE.json lists as active or
-// building at this binary's version: every batch writes them (amendment A2
-// §4.6).
+// builders are the builders of every version a new batch builds: each
+// table's active and building versions, or only the building one while
+// mixed (amendment A2 §4.6, A5 §8, §10).
 func (w *Writer) builders() []derive.Builder {
 	if w.o.NoDerived {
 		return nil
 	}
 	var out []derive.Builder
 	for _, bl := range derive.Builders {
-		st := w.active.Tables[bl.Table().Name]
-		if v := bl.Table().Version; st.Active != nil && *st.Active == v || st.Building != nil && *st.Building == v {
-			out = append(out, bl)
+		for _, t := range w.active.BuildVersions(bl.Table().Name) {
+			if b := derive.BuilderOf(t.Name, t.Version); b != nil {
+				out = append(out, b)
+			}
 		}
 	}
 	return out
@@ -691,11 +696,12 @@ func (b *batch) derive(der []byte, ctx derive.Context) error {
 	return nil
 }
 
-// tables records the derived tables this batch built, for _COMMIT.json.
+// tables records the derived tables this batch built, for _COMMIT.json:
+// the newest version of each; files lists every version's file.
 func (b *batch) tables() map[string]int {
 	out := map[string]int{}
 	for _, bl := range b.builds {
-		out[bl.Table().Name] = bl.Table().Version
+		out[bl.Table().Name] = max(out[bl.Table().Name], bl.Table().Version)
 	}
 	return out
 }

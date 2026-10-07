@@ -11,6 +11,7 @@ import (
 	"github.com/4rji/ctvault/internal/config"
 	"github.com/4rji/ctvault/internal/fetch"
 	"github.com/4rji/ctvault/internal/ingest"
+	"github.com/4rji/ctvault/internal/logreg"
 	"github.com/4rji/ctvault/internal/logsource"
 	"github.com/4rji/ctvault/internal/logsource/rfc6962"
 	"github.com/4rji/ctvault/internal/sample"
@@ -34,6 +35,10 @@ func FromSample(t testing.TB, s *sample.Sample, n, size uint64) *Vault {
 		t.Fatal(err)
 	}
 	defer stop()
+	if err := logreg.Add(root, logreg.Record{Name: s.Manifest.Log.Name, URL: url, LogID: s.Manifest.Log.LogID, Key: s.Manifest.Log.Key,
+		State: "usable"}); err != nil {
+		t.Fatal(err)
+	}
 	chains := logsource.NewChainCache(logsource.DefaultChainCacheBytes)
 	src := rfc6962.NewSource(s.LogInfo(url), nil, chains, nil)
 	head, err := src.Head(ctx)

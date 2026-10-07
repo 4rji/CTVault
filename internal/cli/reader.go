@@ -2,6 +2,7 @@ package cli
 
 import (
 	"errors"
+	"fmt"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -25,7 +26,10 @@ type reader struct {
 	sess *query.Session
 }
 
-func (a *app) openReader(c *cobra.Command, asOf uint64) (*reader, error) {
+func (a *app) openReader(c *cobra.Command, asOf uint64, mixed query.MixedRead) (*reader, error) {
+	if mixed.ParserVersion != 0 && mixed.Allow {
+		return nil, usagef("--parser-version and --allow-mixed exclude each other")
+	}
 	root, id, err := a.openVault(c)
 	if err != nil {
 		return nil, err
@@ -37,6 +41,10 @@ func (a *app) openReader(c *cobra.Command, asOf uint64) (*reader, error) {
 	snap, err := query.Open(root, asOf)
 	if err != nil {
 		return nil, readErr(err)
+	}
+	snap.Mixed = mixed
+	for _, n := range snap.MixedNotes() {
+		fmt.Fprintln(c.ErrOrStderr(), "note: "+n)
 	}
 	sess, err := query.NewSession(root, diskguard.Guard{Cap: cfg.Disk.MaxUsedFraction, Stat: a.d.Statfs})
 	if err != nil {
@@ -55,8 +63,17 @@ func readErr(err error) error {
 		return nil
 	case errors.Is(err, vault.ErrCorrupt), errors.Is(err, commit.ErrCorrupt):
 		return exitcode.With(exitcode.Verification, err)
+	case errors.Is(err, query.ErrMixed):
+		return exitcode.With(exitcode.Usage, err)
 	}
 	return ingestErr(err)
+}
+
+// mixedFlags are --parser-version and --allow-mixed, for readers of a
+// mixed table (amendment A5 §10).
+func mixedFlags(cmd *cobra.Command, m *query.MixedRead) {
+	cmd.Flags().IntVar(&m.ParserVersion, "parser-version", 0, "read only the batches at this version of a mixed table (a partial result)")
+	cmd.Flags().BoolVar(&m.Allow, "allow-mixed", false, "read each batch's own version of a mixed table")
 }
 
 // isTerminal reports whether w is a terminal, where binary output is refused.

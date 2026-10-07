@@ -2,13 +2,10 @@ package cli
 
 import (
 	"fmt"
-	"slices"
-	"strings"
 
 	"github.com/spf13/cobra"
 
 	"github.com/4rji/ctvault/internal/config"
-	"github.com/4rji/ctvault/internal/derive"
 	"github.com/4rji/ctvault/internal/diskguard"
 	"github.com/4rji/ctvault/internal/exitcode"
 	"github.com/4rji/ctvault/internal/fetch"
@@ -76,23 +73,20 @@ func (a *app) openWriter(c *cobra.Command, before func(root string) error) (*ope
 	return &openedWriter{w: w, cfg: cfg, root: root, lk: lk}, nil
 }
 
-// building names the derived tables ACTIVE.json lists as being built.
-func building(a derive.Active) []string {
-	var out []string
-	for name, s := range a.Tables {
-		if s.Status == derive.StatusBuilding {
-			out = append(out, name)
-		}
-	}
-	slices.Sort(out)
-	return out
-}
-
-// warnBuilding tells the user that some derived tables are only exposed as
-// <table>_building until a rebuild (amendment A2 §5.5).
+// warnBuilding tells the user which table versions are being built and how
+// far (amendment A2 §5.5, A5 §8): update advances them in turns, rebuild
+// finishes them at once. A new table is exposed only as <table>_building
+// until then.
 func warnBuilding(c *cobra.Command, w *ingest.Writer) {
-	if b := building(w.Active()); len(b) > 0 {
-		fmt.Fprintf(c.ErrOrStderr(), "warning: %s %s being built: run `ctvault rebuild`\n", strings.Join(b, " and "), isAre(len(b)))
+	for _, u := range w.Upgrades() {
+		if u.Mixed {
+			continue // stats and readers say so
+		}
+		what := fmt.Sprintf("%s v%d is being built (%d of %d batches have it); until then only %s_building shows it", u.Table, u.To, u.Done, u.Total, u.Table)
+		if u.From > 0 {
+			what = fmt.Sprintf("%s v%d is being built beside v%d (%d of %d batches have it)", u.Table, u.To, u.From, u.Done, u.Total)
+		}
+		fmt.Fprintf(c.ErrOrStderr(), "warning: %s: update rebuilds old batches in turns; `ctvault rebuild` finishes it now\n", what)
 	}
 }
 

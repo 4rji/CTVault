@@ -19,6 +19,7 @@ import (
 	"github.com/4rji/ctvault/internal/commit"
 	"github.com/4rji/ctvault/internal/config"
 	"github.com/4rji/ctvault/internal/ctlogtest"
+	"github.com/4rji/ctvault/internal/derivetest"
 	"github.com/4rji/ctvault/internal/diskguard"
 	"github.com/4rji/ctvault/internal/fetch"
 	"github.com/4rji/ctvault/internal/ingest"
@@ -49,8 +50,9 @@ type crashConfig struct {
 	BatchSize uint64
 	KillAt    string // a hook point; "" runs to the end
 	KillNth   int    // die the nth time KillAt fires
-	Mode      string // "" ingests; "rebuild" or "reindex" runs that instead
+	Mode      string // "" ingests; "rebuild", "reindex", "repair-derived", "inplace" (rebuild --in-place) or "gc" runs that instead
 	NoDerived bool   // ingest without derived files, as Plan 2 did
+	Registry  string // a test registry (derivetest) the child carries; "" for the binary's own
 }
 
 // options is the writer configuration of every crash test: small segments
@@ -92,8 +94,15 @@ func TestCrashChild(t *testing.T) {
 			}
 		}
 	}
+	if c.Registry != "" {
+		derivetest.Use(t, c.Registry)
+	}
 	if c.Mode == "reindex" {
 		reindexChild(t, c.Root, hook)
+		return
+	}
+	if c.Mode == "repair-derived" {
+		repairDerivedChild(t, c.Root, hook)
 		return
 	}
 	o := options(c.Root, hook)
@@ -103,8 +112,22 @@ func TestCrashChild(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer w.Close()
-	if c.Mode == "rebuild" {
+	switch c.Mode {
+	case "rebuild":
 		if _, err := w.Rebuild(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		return
+	case "inplace":
+		if err := w.StartInPlace(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Rebuild(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		return
+	case "gc":
+		if _, err := w.RetireOld(true); err != nil {
 			t.Fatal(err)
 		}
 		return

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"maps"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -22,6 +23,7 @@ import (
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 
+	"github.com/4rji/ctvault/internal/derive"
 	"github.com/4rji/ctvault/internal/query"
 )
 
@@ -61,10 +63,12 @@ const (
 	promptWrite
 )
 
-// list is one result: its query and the rows loaded so far.
+// list is one result: its query, its held rows and the rows loaded so far.
 type list struct {
-	text   string      // the bar's text for it
-	q      query.Query // with defaults filled in once a page arrives
+	text   string         // the bar's text for it
+	q      query.Query    // with defaults filled in once a page arrives
+	res    *query.Results // its rows, held once; nil until the first page
+	total  int            // rows in the result
 	cols   []string
 	rows   [][]any
 	next   *query.Cursor // nil after the last page
@@ -72,6 +76,14 @@ type list struct {
 	took   time.Duration // the first page's
 	marks  map[string]bool
 	cursor int
+}
+
+// drop releases the list's held rows.
+func (l *list) drop() {
+	if l.res != nil {
+		l.res.Close()
+		l.res = nil
+	}
 }
 
 // key is a row's identity: the group's unique key as Render shows it, as
@@ -87,10 +99,11 @@ type Model struct {
 	certs *certSource
 
 	// Seams for tests.
-	search      func(ctx context.Context, s *query.Snapshot, sess *query.Session, dirs []string, q query.Query, after *query.Cursor, n int) (*query.Page, error)
+	hold        func(ctx context.Context, s *query.Snapshot, sess *query.Session, dirs []string, q query.Query) (*query.Results, error)
 	since       func(time.Time) time.Duration
 	pageSize    int
 	afterUpdate func(*Model, tea.Msg)
+	pollEvery   time.Duration // how often ACTIVE.json's seq is checked
 
 	w, h   int
 	keys   keyMap
@@ -111,6 +124,8 @@ type Model struct {
 	busy   string // what runs, "" when idle
 	msg    string // the last notice or error, until the next key
 	isErr  bool
+
+	changed string // the reload banner: ACTIVE.json changed since the snapshot
 }
 
 // New makes a session's model. Close releases it.
@@ -118,7 +133,7 @@ func New(o Options) *Model {
 	if o.Now == nil {
 		o.Now = time.Now
 	}
-	m := &Model{o: o, snap: o.Snapshot, search: query.SearchPage, since: time.Since, pageSize: pageSize, group: "names", keys: newKeys()}
+	m := &Model{o: o, snap: o.Snapshot, hold: query.Hold, since: time.Since, pageSize: pageSize, group: "names", keys: newKeys(), pollEvery: 10 * time.Second}
 	m.certs = newCertSource(o.Snapshot, o.Session, o.Dirs)
 	m.bar = textinput.New()
 	m.bar.Prompt = "query: "
@@ -134,19 +149,66 @@ func New(o Options) *Model {
 	return m
 }
 
-// Close cancels what runs and releases the vault reader. The session and
-// snapshot belong to the caller.
+// Close cancels what runs and releases the vault reader and the held
+// rows. The session and snapshot belong to the caller.
 func (m *Model) Close() {
 	m.abort()
 	m.certs.close()
+	for _, l := range m.lists {
+		l.drop()
+	}
 }
 
 // Init runs the initial query, if any.
 func (m *Model) Init() tea.Cmd {
+	poll := m.poll()
 	if strings.TrimSpace(m.bar.Value()) == "" {
+		return poll
+	}
+	return tea.Batch(m.submit(), poll)
+}
+
+// activeMsg is ACTIVE.json as a poll read it.
+type activeMsg struct {
+	a   derive.Active
+	err error
+}
+
+// poll reads ACTIVE.json after pollEvery, off the UI goroutine: one small
+// read, which writes nothing (amendment A5 §9).
+func (m *Model) poll() tea.Cmd {
+	root := m.o.Root
+	if root == "" || m.pollEvery <= 0 {
 		return nil
 	}
-	return m.submit()
+	return tea.Tick(m.pollEvery, func(time.Time) tea.Msg {
+		a, _, err := derive.ReadActive(root)
+		return activeMsg{a, err}
+	})
+}
+
+// onActive shows the reload banner while ACTIVE.json differs from the
+// snapshot's, and polls again.
+func (m *Model) onActive(msg activeMsg) tea.Cmd {
+	switch {
+	case msg.err != nil:
+	case msg.a.Seq == m.snap.Active.Seq:
+		m.changed = ""
+	default:
+		var active []string
+		for _, b := range derive.Builders {
+			name := b.Table().Name
+			nv, ok := msg.a.Readable(name)
+			if ov, was := m.snap.Active.Readable(name); ok && (!was || ov.Version != nv.Version) {
+				active = append(active, fmt.Sprintf("%s v%d is active", name, nv.Version))
+			}
+		}
+		m.changed = "the dataset changed: press R to reload"
+		if len(active) > 0 {
+			m.changed = "the dataset changed (" + strings.Join(active, ", ") + "): press R to reload"
+		}
+	}
+	return m.poll()
 }
 
 // Update handles a message.
@@ -163,7 +225,8 @@ type (
 	pageMsg struct {
 		seq   int
 		l     *list
-		after *query.Cursor
+		res   *query.Results // the rows the page comes from
+		fresh bool           // the first page of res, which the list takes
 		p     *query.Page
 		asOf  uint64
 		took  time.Duration
@@ -190,6 +253,8 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 		return m.onKey(msg)
 	case pageMsg:
 		return m.onPage(msg)
+	case activeMsg:
+		return m.onActive(msg)
 	case certMsg:
 		if msg.seq == m.seq {
 			m.end()
@@ -326,25 +391,56 @@ func (m *Model) submit() tea.Cmd {
 	}
 	q.Group = m.group
 	l := &list{text: text, q: q, marks: map[string]bool{}}
+	for _, old := range m.lists {
+		old.drop()
+	}
 	m.lists, m.cert = []*list{l}, nil
 	m.setFocus(onResults)
 	m.refreshTable()
-	return m.load(l, nil)
+	return m.first(l, nil)
 }
 
-// load fetches a page of l: the first when after is nil.
-func (m *Model) load(l *list, after *query.Cursor) tea.Cmd {
+// first runs l's query and fetches its first page. With from, it reorders
+// from's held rows by l's sort and filter instead: the vault is not read.
+func (m *Model) first(l *list, from *query.Results) tea.Cmd {
 	ctx, seq := m.begin("searching")
-	snap, sess, dirs, q, n, search, since := m.snap, m.o.Session, m.o.Dirs, l.q, m.pageSize, m.search, m.since
+	snap, sess, dirs, q, n, hold, since := m.snap, m.o.Session, m.o.Dirs, l.q, m.pageSize, m.hold, m.since
 	return func() tea.Msg {
 		start := time.Now()
-		p, err := search(ctx, snap, sess, dirs, q, after, n)
-		return pageMsg{seq: seq, l: l, after: after, p: p, asOf: snap.AsOf, took: since(start), err: err}
+		var res *query.Results
+		var err error
+		if from != nil {
+			res, err = from.Reorder(ctx, q.Sort, q.Filter)
+		} else {
+			res, err = hold(ctx, snap, sess, dirs, q)
+		}
+		if err != nil {
+			return pageMsg{seq: seq, l: l, err: err}
+		}
+		p, err := res.Page(ctx, 0, n)
+		if err != nil {
+			res.Close()
+			return pageMsg{seq: seq, l: l, err: err}
+		}
+		return pageMsg{seq: seq, l: l, res: res, fresh: true, p: p, asOf: res.AsOf(), took: since(start)}
+	}
+}
+
+// more fetches l's next page from its held rows.
+func (m *Model) more(l *list) tea.Cmd {
+	ctx, seq := m.begin("searching")
+	res, from, n := l.res, len(l.rows), m.pageSize
+	return func() tea.Msg {
+		p, err := res.Page(ctx, from, n)
+		return pageMsg{seq: seq, l: l, res: res, p: p, err: err}
 	}
 }
 
 func (m *Model) onPage(msg pageMsg) tea.Cmd {
 	if msg.seq != m.seq {
+		if msg.fresh {
+			msg.res.Close() // no list took these rows
+		}
 		return nil // an answer to a query that was cancelled or replaced
 	}
 	m.end()
@@ -353,16 +449,25 @@ func (m *Model) onPage(msg pageMsg) tea.Cmd {
 		return nil
 	}
 	l := msg.l
-	if msg.after == nil {
+	if msg.fresh {
+		if l.res != msg.res {
+			l.drop()
+		}
+		l.res, l.total = msg.res, msg.res.Len()
 		l.rows, l.cursor, l.asOf, l.took = nil, 0, msg.asOf, msg.took
 	}
+	from := len(l.rows)
 	l.q, l.cols, l.next = msg.p.Query, msg.p.Columns, msg.p.Next
 	l.rows = append(l.rows, msg.p.Rows...)
 	if l != m.top() {
 		return nil
 	}
 	m.group = l.q.Group
-	m.refreshTable()
+	if msg.fresh {
+		m.refreshTable()
+	} else {
+		m.appendRows(l, from)
+	}
 	return m.prefetch()
 }
 
@@ -370,10 +475,10 @@ func (m *Model) onPage(msg pageMsg) tea.Cmd {
 // loaded rows (amendment A4 §2.2).
 func (m *Model) prefetch() tea.Cmd {
 	l := m.top()
-	if l == nil || l.next == nil || m.busy != "" || len(l.rows)-l.cursor > max(1, m.pageSize/4) {
+	if l == nil || l.next == nil || l.res == nil || m.busy != "" || len(l.rows)-l.cursor > max(1, m.pageSize/4) {
 		return nil
 	}
-	return m.load(l, l.next)
+	return m.more(l)
 }
 
 func (m *Model) listKey(k tea.KeyPressMsg) tea.Cmd {
@@ -436,7 +541,7 @@ func (m *Model) listKey(k tea.KeyPressMsg) tea.Cmd {
 		return nil
 	case "s":
 		l.q.Sort = nextSort(l.q)
-		return m.reload(l)
+		return m.reorder(l)
 	}
 	m.table, _ = m.table.Update(k)
 	m.moved()
@@ -468,11 +573,23 @@ func certID(l *list, row []any) uint64 {
 	return id
 }
 
-// reload re-runs l from its first page, keeping its marks.
+// reload re-runs l's query from its first page, keeping its marks.
 func (m *Model) reload(l *list) tea.Cmd {
-	l.rows, l.next, l.cursor = nil, nil, 0
+	l.drop()
+	l.rows, l.next, l.cursor, l.total = nil, nil, 0, 0
 	m.refreshTable()
-	return m.load(l, nil)
+	return m.first(l, nil)
+}
+
+// reorder shows l's rows in its new sort and filter, from the held rows
+// when it has them, keeping its marks.
+func (m *Model) reorder(l *list) tea.Cmd {
+	if l.res == nil || l.res.AsOf() != m.snap.AsOf {
+		return m.reload(l)
+	}
+	l.rows, l.next, l.cursor, l.total = nil, nil, 0, 0
+	m.refreshTable()
+	return m.first(l, l.res)
 }
 
 // nextGroup is Tab: the next group, re-running the shown query.
@@ -524,7 +641,7 @@ func (m *Model) open() tea.Cmd {
 		m.group = "certs"
 		m.bar.SetValue(nl.text)
 		m.refreshTable()
-		return m.load(nl, nil)
+		return m.first(nl, nil)
 	case "certs":
 		return m.openCert(certID(l, row), formDetail)
 	}
@@ -535,6 +652,7 @@ func (m *Model) open() tea.Cmd {
 // pop is Esc on a pushed list: back to the one under it, re-run if R
 // re-pinned the snapshot since it loaded.
 func (m *Model) pop() tea.Cmd {
+	m.top().drop()
 	m.lists = m.lists[:len(m.lists)-1]
 	l := m.top()
 	m.group = l.q.Group
@@ -553,9 +671,10 @@ func (m *Model) repin() tea.Cmd {
 		m.fail(err)
 		return nil
 	}
+	s.Mixed = m.snap.Mixed // the session's choice for mixed tables
 	m.abort()
 	m.certs.close()
-	m.snap, m.cert = s, nil
+	m.snap, m.cert, m.changed = s, nil, ""
 	m.certs = newCertSource(s, m.o.Session, m.o.Dirs)
 	m.note(fmt.Sprintf("re-pinned to commit %d", s.AsOf))
 	if l := m.top(); l != nil {
@@ -587,7 +706,7 @@ func (m *Model) promptKey(k tea.KeyPressMsg) tea.Cmd {
 		case promptFilter:
 			l := m.top()
 			l.q.Filter = strings.TrimSpace(v)
-			return m.reload(l)
+			return m.reorder(l)
 		case promptExport:
 			return m.export(v)
 		case promptWrite:
@@ -619,8 +738,19 @@ func (m *Model) export(path string) tea.Cmd {
 	ctx, seq := m.begin("exporting")
 	snap, sess, dirs, q := m.snap, m.o.Session, m.o.Dirs, l.q
 	o := query.ExportOptions{Path: path, Format: format, Version: m.o.Version, Now: m.o.Now, Selection: sel}
+	// The shown rows, from the held rows; the query again when they are not
+	// the shown query's (a cancelled sort or filter).
+	res := l.res
+	if res != nil && (res.AsOf() != snap.AsOf || !reflect.DeepEqual(res.Query(), q)) {
+		res = nil
+	}
 	return func() tea.Msg {
-		err := query.Export(ctx, snap, sess, dirs, q, o)
+		var err error
+		if res != nil {
+			err = res.Export(ctx, o)
+		} else {
+			err = query.Export(ctx, snap, sess, dirs, q, o)
+		}
 		return doneMsg{seq: seq, note: "exported " + what + " to " + path, err: err}
 	}
 }

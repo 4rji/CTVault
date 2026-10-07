@@ -99,7 +99,41 @@ type VaultReport struct {
 	DeltaSavedBatches int                          `json:"delta_saved_batches"`
 	ParseStatus       map[string]int               `json:"parse_status"`
 	Tables            map[string]derive.TableState `json:"tables"`
+	Transitions       []Transition                 `json:"transitions,omitempty"`
 	Incidents         int                          `json:"incidents"`
+}
+
+// Transition is a table version being built, side by side or in place
+// (amendment A5 §8, §10): how many committed batches hold it.
+type Transition struct {
+	Table string `json:"table"`
+	From  int    `json:"from,omitempty"` // 0 for a new table
+	To    int    `json:"to"`
+	Done  int    `json:"done"`
+	Total int    `json:"total"`
+	Mixed bool   `json:"mixed,omitempty"`
+}
+
+func transitions(a derive.Active, ms []commit.Manifest) []Transition {
+	var out []Transition
+	for _, name := range slices.Sorted(maps.Keys(a.Tables)) {
+		s := a.Tables[name]
+		if s.Building == nil {
+			continue
+		}
+		tr := Transition{Table: name, To: *s.Building, Total: len(ms), Mixed: s.Status == derive.StatusMixed}
+		if s.Active != nil {
+			tr.From = *s.Active
+		}
+		file := derive.Table{Name: name, Version: *s.Building}.File()
+		for _, m := range ms {
+			if _, ok := m.Listed(file); ok {
+				tr.Done++
+			}
+		}
+		out = append(out, tr)
+	}
+	return out
 }
 
 // VolumeReport is one filesystem's use.
@@ -275,7 +309,8 @@ func Compute(in Input) Report {
 		r.Logs = append(r.Logs, lr)
 	}
 
-	v := VaultReport{Batches: len(in.Committed), ParseStatus: map[string]int{}, Tables: maps.Clone(in.Active.Tables), Incidents: in.Incidents}
+	v := VaultReport{Batches: len(in.Committed), ParseStatus: map[string]int{}, Tables: maps.Clone(in.Active.Tables), Incidents: in.Incidents,
+		Transitions: transitions(in.Active, in.Committed)}
 	var saved int64
 	for _, m := range in.Committed {
 		v.Entries += uint64(m.Counts.Entries)
@@ -401,17 +436,33 @@ func Text(r Report) string {
 	}
 	f("  parse_status: %s", orNone(strings.Join(mix, ", ")))
 	var tables []string
+	done := map[string]Transition{}
+	for _, tr := range v.Transitions {
+		done[tr.Table] = tr
+	}
+	var mixed []string
 	for _, name := range slices.Sorted(maps.Keys(v.Tables)) {
 		s := v.Tables[name]
-		ver := s.Active
-		if s.Status != derive.StatusComplete {
-			ver = s.Building
-		}
-		if ver != nil {
-			tables = append(tables, fmt.Sprintf("%s v%d %s", name, *ver, s.Status))
+		tr := done[name]
+		switch {
+		case s.Status == derive.StatusMixed:
+			tables = append(tables, fmt.Sprintf("%s mixed (v%d in %d of %d batches)", name, tr.To, tr.Done, tr.Total))
+			mixed = append(mixed, fmt.Sprintf("WARNING: %s is mixed (v%d in %d batches, v%d in the others): queries need --parser-version or --allow-mixed; `ctvault rebuild --in-place` finishes it",
+				name, tr.To, tr.Done, *s.Active))
+		case s.Active != nil && s.Building != nil:
+			tables = append(tables, fmt.Sprintf("%s v%d complete, v%d building (%d of %d batches)", name, *s.Active, tr.To, tr.Done, tr.Total))
+		case s.Building != nil:
+			tables = append(tables, fmt.Sprintf("%s v%d building (%d of %d batches)", name, tr.To, tr.Done, tr.Total))
+		case s.Active != nil && s.Retiring != nil:
+			tables = append(tables, fmt.Sprintf("%s v%d complete, v%d retiring since %s", name, *s.Active, *s.Retiring, s.SwitchedAt.UTC().Format(time.DateTime)))
+		case s.Active != nil:
+			tables = append(tables, fmt.Sprintf("%s v%d %s", name, *s.Active, s.Status))
 		}
 	}
 	f("  derived tables: %s", orNone(strings.Join(tables, ", ")))
+	for _, m := range mixed {
+		f("%s", m)
+	}
 	f("  incidents: %d", v.Incidents)
 	for _, vol := range r.Volumes {
 		f("disk %s (%s): %.1f%% used of %d bytes; cap %.0f%%", vol.Path, vol.Role, 100*vol.UsedFraction, vol.TotalBytes, 100*vol.Cap)

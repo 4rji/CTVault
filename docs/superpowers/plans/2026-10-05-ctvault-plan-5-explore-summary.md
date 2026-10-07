@@ -70,10 +70,69 @@ A4's ten decisions are as approved. The implementation added these:
    - It exited 0, and its `tmp/duckdb-<pid>` folder was removed.
 4. **Gate:** gofmt clean; `go vet` clean with 4 tag sets; race tests pass in production and dev builds (29 packages).
 
+## Follow-up (2026-10-06): Held Results
+
+As built above, each page re-ran the whole query with the keyset predicate. On the sample that was about 91 ms a page. At full scale, A3's worst case (a domain in every batch, about 60 s) would have cost about 60 s *per page*. The user approved the fix ("sigue"): compute each result once and page from it.
+
+**What changed:**
+
+| Piece | Where | What it does |
+|---|---|---|
+| `query.Hold` and `Results` | `internal/query/results.go` | `Hold` runs a query once into a table in the reader session's in-memory DuckDB. `Page(from, n)` reads a range of it. `Reorder(sort, filter)` gives the same rows in another order or under the `/` filter, from the held rows. `Export` writes them. `Len` is the total. `Close` drops them. |
+| Shared SQL | `internal/query/search.go` | `compile` builds a search's SQL once, for `run` (search, keyset pages, exports) and `Hold`. The SQL itself is unchanged. |
+| The TUI | `internal/tui` | Each list holds its rows. Pages, `s` and `/` read the held rows; `Tab`, a new query, `Enter` on a name and `R` run the query. A page appends its rows to the table instead of rebuilding every loaded row. |
+
+**Decisions to review:**
+
+| # | Decision | Why |
+|---|---|---|
+| 11 | **Held rows are an ordinary table in the session's in-memory database**, named `__ctv_held_<n>`, not a `TEMP` table. They spill to `tmp/duckdb-<pid>/` under the session's spill limit. Closing a list, or the session's end, drops them. | DuckDB's temp tables belong to one connection, and `database/sql` pools connections. A spike checked the spill: 5 million rows at a 100 MB memory limit put 934 MiB in the temp folder, with 37 MB in memory; `DROP` freed it. |
+| 12 | **A held page is a range of row numbers**, assigned in the result's order. The table is written in that order, so a range reads only the row groups that hold it: a page near the end costs the same as the first. | The held rows never change, so positions are stable: pages never repeat or skip a row, as A4 §2.2 requires. `SearchPage` (keyset) stays in `query`. |
+| 13 | **`s` and `/` reorder the held rows** and never read the vault. A new order or a filter is a second table; the default order shares the first. `Tab` runs the query again, since another group has other rows. | A sort or a filter of the worst-case domain would otherwise cost the whole query again. |
+| 14 | **The status line shows the result's total from the first page** ("443748 names"), not "200+" until the last page. | **This changes A4's decision 3**, which you approved. The total costs nothing once the rows are held. One line in `counts()` restores "200+". |
+| 15 | **Exports from `explore` write the held rows.** They are the rows on screen, and the bytes equal `search`'s export of the same query (tested). After a cancelled sort or filter, the shown query is not the held one, so `explore` runs the query as before. | No second run of a slow query. |
+| 16 | **`Close` never waits.** A read that is running keeps the rows until it ends, and then drops them. | `explore` closes rows on its UI goroutine. An export that holds a read for its whole run would otherwise freeze the screen on `Tab`. |
+
+**Evidence (2026-10-06):**
+
+1. **`query` tests** (`results_test.go`, `results_internal_test.go`):
+   - Held pages equal `Search` for the 8 paged queries: every group, both directions, NULLs and the filter. Each query's other sorts and filters, reordered from its held rows, equal `Search` with that sort and filter.
+   - With the vault's Parquet files deleted after `Hold`, pages, `Reorder` and `Export` still work, and the export's bytes equal `Export`'s from before the deletion. A search then fails, which shows the files were needed.
+   - Exports of a selection equal `Export`'s, CSV and side metadata included.
+   - Sharing: the last `Close` drops the rows; a closed result refuses pages.
+   - Edges: no matching row, a bad sort (`ErrUsage`), and a cancelled `Hold`, which leaves no table.
+   - `Close` returns at once while a read runs; the table goes when the read ends.
+   - Mutation checks: a reversed sort, a dropped filter and a wrong next-page rule each fail the tests.
+2. **TUI tests:**
+   - Paging three groups runs the query 3 times. `Tab` back runs it once more. Two sorts and a filter run it 0 times.
+   - Held tables follow the lists: 1 for a query, 2 with a sort, 3 with a name's certificates pushed, 2 after `Esc`, 1 after `Tab`, a new query or `R`, and 0 after `explore` closes.
+   - A cancelled query's rows, and those of a completed answer that arrives stale, are dropped. Mutation-checked.
+   - The golden screens are unchanged. The suite passes under `-race`, 4 runs in a row.
+3. **Real data** (the canonical sample of 100,000 entries):
+
+   | Session | Before | Held |
+   |---|---|---|
+   | `on.aws` names, 26,272 rows: first page | 92 ms | 101 ms |
+   | `on.aws` names: every page (132), through the UI | 12.0 s | 2.5 s |
+   | a sort / the filter | a full query each | 53 ms / 28 ms |
+   | the `query` package alone: one page | 61 ms (keyset) | 1.3 ms |
+
+   The remaining UI time per page is mostly the test harness's polling and screen capture.
+4. **The 1,000,000-entry smoke vault** (`amazonaws.com`):
+
+   | Group | Rows | Hold (once) | A page | A page near the end | Sort | Filter | A keyset page |
+   |---|---|---|---|---|---|---|---|
+   | names | 443,748 | 599 ms | 1.7 ms | 1.3 ms | 176 ms | 86 ms | 471 ms |
+   | certs | 168,566 | 301 ms | 2.0 ms | 2.0 ms | 111 ms | 120 ms | 230 ms |
+   | issuances | 168,560 | 383 ms | 1.7 ms | 1.7 ms | 121 ms | 78 ms | 291 ms |
+
+   - The dev binary in a pseudo-terminal: the first page in 0.7 s (443,748 names), six `End` pages, `s`, then `Tab`, `Enter`, `f`, `?` and `q`.
+   - It exited 0, and its spill folder was removed.
+5. **Gate:** green (29 packages).
+
+**At full scale:** A3's worst-case domain still pays its query once (about 60 s), then pages cost milliseconds. A sort or a filter rewrites the held rows: linear in their number (176 ms for 443,748 rows). Its full-scale cost is not measured.
+
 ## Known Gaps
 
-- **Each page re-runs the whole query** with the keyset predicate. For `on.aws` on the sample that is about 91 ms a page. At full scale, A3's worst case (a domain in every batch, about 60 s) would cost about 60 s *per page*. A rare domain (about 1 s) is fine.
-  - **The fix, to decide:** materialize a query's result once, in a DuckDB temp table that can spill to `tmp/duckdb-<pid>/`, and page from it. Pages stay keyset pages, but only the first one pays.
-  - This changes A4 §2.2's execution, not its behaviour.
 - **`Ctrl-V` paste in the bar** uses Bubbles' clipboard support, which runs `xclip`, `xsel` or `wl-paste` when one is installed. A terminal's own paste (bracketed paste) needs nothing.
 - **The detail pane** does not show the key algorithm or the linked certificate, as the spec's mockup did (decision 5).

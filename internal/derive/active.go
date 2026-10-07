@@ -7,6 +7,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/4rji/ctvault/internal/fsutil"
 )
@@ -18,7 +20,8 @@ const ActiveFile = "ACTIVE.json"
 // Table statuses.
 const (
 	StatusComplete = "complete" // every committed batch has the active version
-	StatusBuilding = "building" // a version is being built; only <table>_building is exposed
+	StatusBuilding = "building" // a version is being built: exposed as <table>_building, beside the active one if any
+	StatusMixed    = "mixed"    // an in-place rebuild: each batch has one version or the other (amendment A5 §10)
 )
 
 // TableState is one table's entry in ACTIVE.json.
@@ -26,6 +29,10 @@ type TableState struct {
 	Active   *int   `json:"active"`
 	Building *int   `json:"building"`
 	Status   string `json:"status"`
+	// Retiring is the version a switch replaced, whose files remain until
+	// they are retired, and SwitchedAt the switch's time (amendment A5 §9).
+	Retiring   *int       `json:"retiring,omitempty"`
+	SwitchedAt *time.Time `json:"switched_at,omitempty"`
 }
 
 // Active is ACTIVE.json.
@@ -66,34 +73,113 @@ func (a Active) AllComplete() bool {
 	return len(a.Tables) > 0
 }
 
-// Check refuses an ACTIVE.json this binary cannot honour (spec §7.5): a table
-// or a version it does not know, a table it lacks, or an unknown status.
+// Check refuses an ACTIVE.json this binary cannot honour (spec §7.5,
+// amendment A5 §7): a table it does not carry or lacks, a version it does
+// not carry, or a state that is not one of these:
+//
+//	complete   active N or N−1, nothing building (with retiring < active
+//	           and its switch time while old files remain)
+//	building   active N−1 and building N (an upgrade), or building N alone
+//	           (a new table)
+//	mixed      active N−1 and building N (an in-place rebuild)
+//
+// N is the binary's current version and N−1 its previous one, if it
+// carries one: a vault older than that needs the release in between.
 func (a Active) Check() error {
-	known := map[string]Table{}
 	for _, b := range Builders {
-		known[b.Table().Name] = b.Table()
 		if _, ok := a.Tables[b.Table().Name]; !ok {
 			return fmt.Errorf("%s lacks table %s", ActiveFile, b.Table().Name)
 		}
 	}
 	for name, s := range a.Tables {
-		tb, ok := known[name]
+		cur, prev, ok := versions(name)
 		if !ok {
 			return fmt.Errorf("%s names table %s, which this binary does not build: upgrade ctvault", ActiveFile, name)
 		}
-		for _, v := range []*int{s.Active, s.Building} {
-			if v != nil && *v != tb.Version {
-				return fmt.Errorf("%s names %s version %d; this binary builds version %d", ActiveFile, name, *v, tb.Version)
-			}
+		known := func(v *int) bool { return v == nil || *v == cur || (prev != 0 && *v == prev) }
+		if !known(s.Active) || !known(s.Building) {
+			return fmt.Errorf("%s names %s version %s; this binary carries %s: upgrade ctvault, through the release in between if the vault is older",
+				ActiveFile, name, versionList(s.Active, s.Building), versionList(&cur, intOrNil(prev)))
 		}
-		switch {
-		case s.Status == StatusComplete && s.Active != nil && s.Building == nil:
-		case s.Status == StatusBuilding && s.Building != nil:
-		default:
-			return fmt.Errorf("%s: table %s has an inconsistent state %+v", ActiveFile, name, s)
+		valid := false
+		switch s.Status {
+		case StatusComplete:
+			valid = s.Active != nil && s.Building == nil &&
+				(s.Retiring == nil) == (s.SwitchedAt == nil) && (s.Retiring == nil || *s.Retiring < *s.Active)
+		case StatusBuilding:
+			valid = s.Building != nil && *s.Building == cur && (s.Active == nil || *s.Active < cur) && s.Retiring == nil
+		case StatusMixed:
+			valid = s.Active != nil && s.Building != nil && *s.Building == cur && *s.Active < cur && s.Retiring == nil
+		}
+		if !valid {
+			return fmt.Errorf("%s: table %s has an inconsistent state %s", ActiveFile, name, describe(s))
 		}
 	}
 	return nil
+}
+
+func intOrNil(v int) *int {
+	if v == 0 {
+		return nil
+	}
+	return &v
+}
+
+func versionList(vs ...*int) string {
+	var out []string
+	for _, v := range vs {
+		if v != nil {
+			out = append(out, fmt.Sprintf("v%d", *v))
+		}
+	}
+	return strings.Join(out, " and ")
+}
+
+func describe(s TableState) string {
+	f := func(v *int) string {
+		if v == nil {
+			return "null"
+		}
+		return fmt.Sprint(*v)
+	}
+	return fmt.Sprintf("{active %s, building %s, status %q, retiring %s}", f(s.Active), f(s.Building), s.Status, f(s.Retiring))
+}
+
+// Readable returns the version of a table readers use: its active version,
+// unless it has none or is mixed (amendment A5 §7).
+func (a Active) Readable(name string) (Table, bool) {
+	s, ok := a.Tables[name]
+	if !ok || s.Active == nil || s.Status == StatusMixed {
+		return Table{}, false
+	}
+	return tableAt(name, *s.Active), true
+}
+
+// BuildVersions are the versions of a table a new batch builds: the active
+// and the building one, or only the building one while mixed (amendment A5
+// §8, §10).
+func (a Active) BuildVersions(name string) []Table {
+	s, ok := a.Tables[name]
+	if !ok {
+		return nil
+	}
+	var out []Table
+	if s.Active != nil && s.Status != StatusMixed {
+		out = append(out, tableAt(name, *s.Active))
+	}
+	if s.Building != nil {
+		out = append(out, tableAt(name, *s.Building))
+	}
+	return out
+}
+
+// tableAt is a version's table definition: the builder's when the binary
+// carries it, else the name and version alone (enough for its file name).
+func tableAt(name string, version int) Table {
+	if b := BuilderOf(name, version); b != nil {
+		return b.Table()
+	}
+	return Table{Name: name, Version: version}
 }
 
 // ReadActive reads dataset/ACTIVE.json; ok is false when it does not exist.

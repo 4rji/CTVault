@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 
 	duckdb "github.com/duckdb/duckdb-go/v2"
@@ -23,6 +24,7 @@ type Session struct {
 	connector *duckdb.Connector // nil for a borrowed database
 	db        *sql.DB
 	spill     string
+	held      atomic.Uint64 // names held tables (results.go)
 }
 
 // SessionOn reads through a database the caller owns, such as the writer's
@@ -60,6 +62,10 @@ func NewSession(root string, g diskguard.Guard) (*Session, error) {
 	}
 	return &Session{connector: c, db: sql.OpenDB(c), spill: spill}, nil
 }
+
+// DB is the session's database, for read-only checks that go beyond
+// search (verify --full). Its queries spill into the session's folder.
+func (s *Session) DB() *sql.DB { return s.db }
 
 // Close ends the session and removes its spill folder.
 func (s *Session) Close() error {

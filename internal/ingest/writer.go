@@ -72,6 +72,7 @@ type Writer struct {
 	committed []commit.Manifest
 	tips      map[string]commit.LogTip
 	active    derive.Active // dataset/ACTIVE.json
+	warnings  []string      // what the writer's start could not do, for the user
 }
 
 func (w *Writer) logf(format string, args ...any) {
@@ -158,6 +159,12 @@ func Open(o Options) (*Writer, error) {
 	if w.active, err = settleActive(o.Root, len(rec.Committed) > 0); err != nil {
 		return nil, err
 	}
+	if err := w.startUpgrades(); err != nil {
+		return nil, err
+	}
+	if _, err := w.RetireOld(false); err != nil {
+		return nil, err
+	}
 	if _, err := dataset.WriteViews(o.Root, w.active); err != nil {
 		return nil, err
 	}
@@ -227,11 +234,40 @@ func settleActive(root string, committed bool) (derive.Active, error) {
 			return a, err
 		}
 	}
+	// A table this binary carries and ACTIVE.json lacks is new (spec §7.8):
+	// built from the vault in turns when batches exist, complete at once
+	// otherwise.
+	added := false
+	for _, b := range derive.Builders {
+		t := b.Table()
+		if _, ok := a.Tables[t.Name]; ok {
+			continue
+		}
+		if a.Tables == nil {
+			a.Tables = map[string]derive.TableState{}
+		}
+		v := t.Version
+		a.Tables[t.Name] = derive.TableState{Active: &v, Status: derive.StatusComplete}
+		if committed {
+			a.Tables[t.Name] = derive.TableState{Building: &v, Status: derive.StatusBuilding}
+		}
+		added = true
+	}
+	if added {
+		a.Seq++
+		if err := derive.WriteActive(root, a); err != nil {
+			return a, err
+		}
+	}
 	return a, a.Check()
 }
 
 // Active returns the vault's ACTIVE.json state.
 func (w *Writer) Active() derive.Active { return w.active }
+
+// Warnings are what the writer's start could not do, such as an upgrade
+// without room.
+func (w *Writer) Warnings() []string { return w.warnings }
 
 // Next returns the first index of log not yet committed.
 func (w *Writer) Next(log string) uint64 { return w.tips[log].Next }

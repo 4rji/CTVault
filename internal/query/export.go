@@ -36,6 +36,8 @@ type Meta struct {
 	RowCount       int            `json:"row_count"`
 	Approximate    bool           `json:"approximate"`
 	Selection      *Selection     `json:"selection,omitempty"`
+	// Mixed records how mixed tables were read (amendment A5 §10).
+	Mixed []MixedTable `json:"mixed_tables,omitempty"`
 }
 
 // Selection records an export of marked rows (amendment A4 §3): the
@@ -49,7 +51,7 @@ type Selection struct {
 // NewMeta describes a search's result over s.
 func NewMeta(s *Snapshot, q Query, version string, now time.Time, rows int) Meta {
 	m := Meta{CTVaultVersion: version, GeneratedAt: now.UTC(), Query: q, AsOfCommitSeq: s.AsOf, RowCount: rows,
-		Builders: map[string]any{"extractor": derive.ExtractorVersion, "psl": derive.PSLSnapshot}}
+		Builders: map[string]any{"extractor": derive.ExtractorVersion, "psl": derive.PSLSnapshot}, Mixed: s.mixedReads()}
 	for name, st := range s.Active.Tables {
 		if st.Active != nil {
 			m.Builders[name] = *st.Active
@@ -87,6 +89,12 @@ type ExportOptions struct {
 // assembled, fsynced and renamed into place, so a reader never sees a
 // partial export. A CSV's metadata goes to <path>.meta.json.
 func Export(ctx context.Context, s *Snapshot, sess *Session, vaultDirs []string, q Query, o ExportOptions) error {
+	return export(s, &q, o, func(fn rowFunc) error { return run(ctx, s, sess, vaultDirs, &q, nil, q.Limit, fn) })
+}
+
+// export writes the rows each gives; each normalizes *q before its first
+// row.
+func export(s *Snapshot, q *Query, o ExportOptions, each func(rowFunc) error) error {
 	if o.Format != "md" && o.Format != "json" && o.Format != "csv" {
 		return usage("export format %q (md, json or csv)", o.Format)
 	}
@@ -117,7 +125,7 @@ func Export(ctx context.Context, s *Snapshot, sess *Session, vaultDirs []string,
 			sel[k] = true
 		}
 	}
-	err = run(ctx, s, sess, vaultDirs, &q, nil, q.Limit, func(cols []string, row []any, c Cursor) error {
+	err = each(func(cols []string, row []any, c Cursor) error {
 		if sel != nil && !sel[Render(c.Tie)] {
 			return nil
 		}
@@ -141,7 +149,7 @@ func Export(ctx context.Context, s *Snapshot, sess *Session, vaultDirs []string,
 	if err := rw.End(); err != nil {
 		return err
 	}
-	meta := NewMeta(s, q, o.Version, o.Now(), rows)
+	meta := NewMeta(s, *q, o.Version, o.Now(), rows)
 	if sel != nil {
 		meta.Selection = &Selection{Key: KeyColumn(q.Group), Values: slices.Sorted(maps.Keys(sel))}
 	}

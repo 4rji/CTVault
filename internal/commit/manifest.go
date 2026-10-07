@@ -1,6 +1,7 @@
 package commit
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -66,6 +67,23 @@ type STH struct {
 type Verified struct {
 	Method     string `json:"method"` // "consistency_proof" or "root_equals_sth"
 	ProofNodes int    `json:"proof_nodes"`
+	// Proof is the consistency proof itself, hex nodes, so that verify can
+	// check it again offline (amendment A5 §2.3). Batches committed before
+	// it was recorded have none.
+	Proof []string `json:"proof,omitempty"`
+}
+
+// DecodeProof returns the recorded proof's nodes.
+func (v Verified) DecodeProof() ([][32]byte, error) {
+	out := make([][32]byte, len(v.Proof))
+	for i, h := range v.Proof {
+		b, err := hex.DecodeString(h)
+		if err != nil || len(b) != 32 {
+			return nil, corrupt("proof node %d is not a SHA-256 hash", i)
+		}
+		out[i] = [32]byte(b)
+	}
+	return out, nil
 }
 
 // Span is a vault range [Start, End).
@@ -149,10 +167,10 @@ func corrupt(format string, args ...any) error {
 }
 
 // readManifest reads and checks a committed batch directory: its manifest
-// must be complete and consistent with the directory name, and every listed
-// file must exist with its recorded size. Full checksums are left to
-// "ctvault verify" (amendment decision, Plan 2B).
-func readManifest(dir, log, span string) (Manifest, error) {
+// must be complete and consistent with the directory name, and, with
+// sizes, every listed file must exist with its recorded size. Full
+// checksums are left to "ctvault verify" (amendment decision, Plan 2B).
+func readManifest(dir, log, span string, sizes bool) (Manifest, error) {
 	b, err := os.ReadFile(filepath.Join(dir, ManifestFile))
 	if err != nil {
 		return Manifest{}, corrupt("committed batch %s has no readable %s: %v", dir, ManifestFile, err)
@@ -177,14 +195,19 @@ func readManifest(dir, log, span string) (Manifest, error) {
 	if ok {
 		m.Derived = &d
 	}
-	sizes := map[string]int64{}
+	if !sizes {
+		return m, nil
+	}
+	want := map[string]int64{}
 	for name, fi := range m.Files {
-		sizes[name] = fi.Bytes
+		if !m.Retired(name) {
+			want[name] = fi.Bytes
+		}
 	}
 	for _, t := range d.Tables {
-		sizes[t.File] = t.Bytes
+		want[t.File] = t.Bytes
 	}
-	for name, size := range sizes {
+	for name, size := range want {
 		st, err := os.Stat(filepath.Join(dir, name))
 		if err != nil || st.Size() != size {
 			return m, corrupt("%s/%s is missing or has the wrong size", dir, name)
@@ -196,7 +219,14 @@ func readManifest(dir, log, span string) (Manifest, error) {
 // ListCommitted reads every committed batch, ordered by commit_seq, and
 // checks that each log's batches are contiguous from index 0 and that
 // commit_seq values are unique.
-func ListCommitted(root string) ([]Manifest, error) {
+func ListCommitted(root string) ([]Manifest, error) { return listCommitted(root, true) }
+
+// ListCommittedForRepair is ListCommitted without the files' sizes, so
+// that repair --derived can list a batch whose derived file is missing or
+// cut short: the file it rebuilds (amendment A5 §3.2).
+func ListCommittedForRepair(root string) ([]Manifest, error) { return listCommitted(root, false) }
+
+func listCommitted(root string, sizes bool) ([]Manifest, error) {
 	logs, err := os.ReadDir(filepath.Join(root, "dataset"))
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
@@ -220,7 +250,7 @@ func ListCommitted(root string) ([]Manifest, error) {
 			if !ok || !b.IsDir() {
 				continue
 			}
-			m, err := readManifest(filepath.Join(root, "dataset", l.Name(), b.Name()), log, span)
+			m, err := readManifest(filepath.Join(root, "dataset", l.Name(), b.Name()), log, span, sizes)
 			if err != nil {
 				return nil, err
 			}

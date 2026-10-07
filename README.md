@@ -3,8 +3,10 @@
 A local, cryptographically verified Certificate Transparency research archive.
 Design: `docs/superpowers/specs/2026-10-04-ctvault-design.md`.
 
-**Status:** Plan 5 (`explore`, the terminal UI) on top of Plan 4 (the read
-path: `search`, `fetch`, export, the post-commit audit).
+**Status:** Plan 6B (version transitions: upgrades in turns, `gc`,
+`rebuild --in-place`) and 6A (`verify`, `repair`) on top of Plan 5 (`explore`,
+the terminal UI) and Plan 4 (the read path: `search`, `fetch`, export, the
+post-commit audit).
 `ctvault update` ingests pinned logs into the vault:
 - Every batch is verified against a signed tree head.
 - Every unique certificate is stored once, compressed with libzstd and a
@@ -98,6 +100,8 @@ export CTVAULT_ROOT=/mnt/ctvault
 ./ctvault explore example.com "issuer:Let's Encrypt" since:2026-10   # the terminal UI
 
 ./ctvault stats                          # progress, ETA, disk use, projected cap date
+./ctvault verify                         # manifests, IDs, segments, sizes, tables, signed heads: seconds
+./ctvault verify --full                  # also every byte: checksums, records, Merkle trees, the index
 ./ctvault stats --json
 ./ctvault explain-error san_ip_bad_len    # what a parse or leaf error code means
 ```
@@ -126,12 +130,25 @@ duckdb -c ".read /mnt/ctvault/views.sql" -c "SELECT c.issuer_cn, c.not_before FR
 duckdb -c ".read /mnt/ctvault/views.sql" -c "SELECT median(logging_delay) FROM logging_delay"
 ```
 
-**Vaults written before Plan 3** gain the derived tables locally, without
-downloading anything again:
-- **Before the rebuild:** the views show them only as `certs_building` and
-  `names_building`, and `update` warns about it.
-- **The rebuild:** `ctvault rebuild` builds them from the vault and then
-  exposes `certs` and `names`. It can be interrupted, or killed, and resumed.
+**New table versions are built from the vault**, never downloaded again:
+- **A vault written before Plan 3, or a new table:** the views show it only as
+  `<table>_building` until every batch has it, and `update` says how far it is.
+- **A newer binary with a new version of a table** (say `certs` v2) starts an
+  upgrade side by side, if a second copy fits under the disk cap. Readers keep
+  using v1 until the switch:
+  - new batches build both versions;
+  - `update` rebuilds one old batch after each new one
+    (`rebuild.batches_per_turn`), and under `--follow` between cycles;
+  - `ctvault rebuild` does the rest at once.
+  - When every batch has v2, it becomes active and v1 is "retiring":
+    `ctvault gc` deletes its files now, and `update` and `rebuild` do it 24 hours
+    after the switch, so open `explore` sessions can reload (they show a banner;
+    `R` reloads).
+- **Without room for both:** `ctvault rebuild --in-place` replaces each batch's
+  v1 as it goes. The table is "mixed" meanwhile, and readers refuse it unless
+  given `--parser-version N` (only the batches at N, a partial result) or
+  `--allow-mixed` (each batch's own version). `stats` warns while it lasts.
+- **Every step can be interrupted, or killed, and resumed.**
 
 **Search** (`ctvault search --help` lists every flag):
 - **Modes:** a registrable domain (the default), `--suffix`, `--exact`, `--ip`, and `--contains` or `--regex`, which scan every name and are slow on a large vault.
@@ -142,15 +159,38 @@ downloading anything again:
 **Explore** (`ctvault explore [query] [--as-of N]`, a terminal of at least 80×24):
 - **The bar** takes search's syntax as terms: a domain, or `suffix:`, `exact:`, `ip:`, `contains:`, `regex:`, then `issuer:`, `org:`, `issued-by:`, `key:`, `kind:`, `status:`, `valid-at:`, `wildcard`, `log:`, `since:`, `until:`, `by:not-before`. Values with spaces go in double quotes.
 - **Keys:** `Tab` switches names, certs and issuances; `Enter` opens a name's certificates or a certificate's detail (names, entries, chains, the precert↔final link); `f` shows the text dump or the PEM and `w` writes it (never over a file); `Space` marks rows and `e` exports the marked rows, or all, with the selection in the metadata; `/` filters the whole result; `s` sorts; `Esc` cancels or goes back; `R` re-pins the latest commit; `?` lists the keys.
-- **The same rows as search:** explore pages through the same queries, 200 rows at a time. Without a terminal it exits 2 and points to `search`.
+- **The same rows as search:** explore runs a query once and holds its rows in the reader session (they spill to `tmp/duckdb-<pid>/` when large), then shows them 200 at a time. Pages, `s` and `/` read the held rows, not the vault. Without a terminal it exits 2 and points to `search`.
 
 **Post-commit audit:** after every batch, `update` looks the batch up through
 the read path. A failure is recorded in `state/health.json` and shown by
 `stats`; the batch stays committed.
 
-**Index problems:** `ctvault repair --reindex` rebuilds the Pebble index from
-the vault, beside the current one, and swaps the two atomically. A `rebuild`
-that finds the index disagreeing with the vault says so and points to it.
+**Verify:** `ctvault verify` checks the vault without changing it and exits 5
+when it finds damage. It takes no lock and never stops `update`: it checks the
+batches committed when it starts.
+- `--quick`, the default, reads manifests and metadata in seconds: contiguous
+  batches, `cert_id` ranges and `ID_FLOOR`, vault segments and dictionaries,
+  every file's size, `ACTIVE.json` and `views.sql`, and each signed head's
+  signature.
+- `--full` also hashes every file, decodes every vault record against its
+  `certs` row, checks that every `cert_id` an entry or chain names exists,
+  rebuilds each log's Merkle tree and re-verifies the signed heads, the
+  consistency proofs included (recorded in `_COMMIT.json` since Plan 6A).
+  When no writer holds the lock, it also checks the index.
+- What a stopped writer leaves (an intent, bytes past the tail, `tmp/`
+  leftovers) is reported as "recovery pending", not damage.
+
+**Repairs:** both run under the writer lock, and neither deletes committed
+data nor rewrites a manifest.
+- `ctvault repair --reindex` rebuilds the Pebble index from the vault, beside
+  the current one, and swaps the two atomically. Its memory does not grow
+  with the vault. A `rebuild` that finds the index disagreeing with the vault
+  says so and points to it.
+- `ctvault repair --derived [--batch ID]` rebuilds `certs` and `names` files
+  that are missing or fail their recorded checksum, and replaces each one
+  only when the rebuilt file reproduces that checksum. Damaged source data
+  (vault records, `entries`, `chains`) is named, and must be restored from a
+  backup.
 
 Log names are the conventional names from the log list, lowercased:
 `argon2027h1`, `wyvern2027h1`, `oak2026h2`, `mammoth2026h2` and so on.

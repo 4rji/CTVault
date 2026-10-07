@@ -7,21 +7,41 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// newRebuildCmd is ctvault rebuild (amendment A2 §5.2): it fills in the
-// derived tables that are being built from the local vault, then switches
-// them to complete. Killed or interrupted, it resumes where it stopped.
+// newRebuildCmd is ctvault rebuild (amendment A2 §5.2, A5 §8, §10): it
+// builds every table version being built from the local vault, all at once,
+// then switches them; with --in-place it first turns the pending upgrades
+// into in-place conversions. Killed or interrupted, it resumes where it
+// stopped.
 func newRebuildCmd(a *app) *cobra.Command {
-	return &cobra.Command{
-		Use:   "rebuild",
-		Short: "Build the derived tables that are being built, from the local vault",
-		Args:  usageArgs(cobra.NoArgs),
+	var inPlace bool
+	cmd := &cobra.Command{
+		Use:   "rebuild [--in-place]",
+		Short: "Build the derived table versions that are being built, from the local vault",
+		Long: `Build the derived table versions that are being built, from the local vault,
+all at once (update builds them in turns), then switch to them. --in-place
+replaces each batch's old version as it goes, when the disk cannot hold both:
+the table is mixed meanwhile, and readers need --parser-version or
+--allow-mixed until it is complete.`,
+		Args: usageArgs(cobra.NoArgs),
 		RunE: func(c *cobra.Command, _ []string) error {
 			ow, err := a.openWriter(c, nil)
 			if err != nil {
 				return err
 			}
 			defer ow.close()
-			tables := building(ow.w.Active())
+			if inPlace {
+				if err := ow.w.StartInPlace(); err != nil {
+					return ingestErr(err)
+				}
+			} else {
+				for _, x := range ow.w.Warnings() {
+					fmt.Fprintln(c.ErrOrStderr(), "warning: "+x)
+				}
+			}
+			var tables []string
+			for _, u := range ow.w.Upgrades() {
+				tables = append(tables, u.Table)
+			}
 			st, err := ow.w.Rebuild(c.Context())
 			if err != nil {
 				return ingestErr(err)
@@ -35,4 +55,6 @@ func newRebuildCmd(a *app) *cobra.Command {
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&inPlace, "in-place", false, "replace each batch's old version as it goes, when the disk cannot hold both")
+	return cmd
 }

@@ -96,13 +96,21 @@ func (u *updateRun) run(c *cobra.Command) error {
 	defer ow.close()
 	w, cfg, root, out := ow.w, ow.cfg, ow.root, c.OutOrStdout()
 	warnBuilding(c, w)
+	for _, x := range w.Warnings() {
+		fmt.Fprintln(c.ErrOrStderr(), "warning: "+x)
+	}
 	stops := stop.OnSignals(c.Context(), func() {
 		fmt.Fprintln(c.ErrOrStderr(), "interrupt: finishing the current batch, then stopping; press Ctrl-C again to abandon it")
 	}, func() {
 		fmt.Fprintln(c.ErrOrStderr(), "interrupt: abandoning the current batch; it will be fetched again next time")
 	})
 	defer stops.Close()
-	for {
+	for cycle := 0; ; cycle++ {
+		if cycle > 0 { // the writer's start already did it
+			if _, err := w.RetireOld(false); err != nil {
+				return ingestErr(err)
+			}
+		}
 		for _, rec := range recs {
 			warning, err := afterCycle(u.cycle(c, stops, w, rec, cfg, root), u.follow, stops.Hard.Err() != nil)
 			if err != nil {
@@ -119,11 +127,19 @@ func (u *updateRun) run(c *cobra.Command) error {
 		if !u.follow {
 			return nil
 		}
+		// Between cycles a transition takes the idle time, one old batch at
+		// a time, until the next cycle is due (amendment A5 §8).
+		next := time.Now().Add(cfg.Ingest.FollowInterval.Duration)
+		for pending := true; pending && time.Now().Before(next) && stops.Soft.Err() == nil; {
+			if _, pending, err = w.RebuildTurn(stops.Hard, 1); err != nil {
+				return ingestErr(err)
+			}
+		}
 		select {
 		case <-stops.Soft.Done():
 			fmt.Fprintln(out, "stopped between cycles")
 			return nil
-		case <-time.After(cfg.Ingest.FollowInterval.Duration):
+		case <-time.After(time.Until(next)):
 		}
 	}
 }
@@ -243,6 +259,11 @@ func (u *updateRun) cycle(c *cobra.Command, stops *stop.Contexts, w *ingest.Writ
 			return err
 		}
 		first = last
+		// A transition advances in turns: old batches after each new one
+		// (amendment A5 §8).
+		if _, _, err := w.RebuildTurn(stops.Hard, cfg.Rebuild.BatchesPerTurn); err != nil {
+			return err
+		}
 	}
 	return nil
 }

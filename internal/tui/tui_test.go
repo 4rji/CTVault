@@ -18,6 +18,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/x/exp/teatest/v2"
+
+	"github.com/4rji/ctvault/internal/derive"
 	"github.com/4rji/ctvault/internal/query"
 )
 
@@ -72,24 +75,33 @@ func TestGoldenScreens(t *testing.T) {
 // the pages explore loads are search's rows (amendment A4 §2.2, §3).
 func TestExploreGivesSearchRows(t *testing.T) {
 	v := testVault(t)
-	h := start(t, v, setup{tweak: func(m *Model) { m.pageSize = 7 }})
+	var holds atomic.Int32
+	h := start(t, v, setup{tweak: func(m *Model) {
+		m.pageSize = 7
+		real := m.hold
+		m.hold = func(c context.Context, s *query.Snapshot, sess *query.Session, dirs []string, q query.Query) (*query.Results, error) {
+			holds.Add(1)
+			return real(c, s, sess, dirs, q)
+		}
+	}})
+	q := query.Query{Mode: query.ModeDomain, Text: "example.test"}
+	r := h.search(q)
+	// The count is the whole result's from the first page on.
 	st := h.query("example.test")
-	if st.rows != 7 || !st.more || !strings.Contains(st.screen, "7+ names") {
+	if st.rows != 7 || !st.more || !strings.Contains(st.screen, fmt.Sprintf("%d names ·", len(r.Rows))) {
 		t.Fatalf("the first page: %+v\n%s", st, st.screen)
 	}
 	h.all()
-	q := query.Query{Mode: query.ModeDomain, Text: "example.test"}
-	r := h.search(q)
 	sameRows(t, "names", h.rows(), r)
-	if st := h.settled(); !strings.Contains(st.screen, fmt.Sprintf("%d names", len(r.Rows))) {
-		t.Fatalf("the count after the last page:\n%s", st.screen)
-	}
 
 	for _, g := range []string{"certs", "issuances"} {
 		h.key("tab")
 		h.all()
 		q.Group = g
 		sameRows(t, g, h.rows(), h.search(q))
+	}
+	if n := holds.Load(); n != 3 {
+		t.Fatalf("%d queries ran for 3 groups' pages", n)
 	}
 
 	// s: the next column, descending, then ascending.
@@ -118,6 +130,48 @@ func TestExploreGivesSearchRows(t *testing.T) {
 		t.Fatalf("search with the filter: %d rows", len(r.Rows))
 	}
 	sameRows(t, "filtered", h.rows(), r)
+	// Sorts and the filter reorder the held rows: no query ran for them.
+	if n := holds.Load(); n != 4 {
+		t.Fatalf("%d queries ran, want 4: one per group, then names again", n)
+	}
+}
+
+// TestHeldRowsFollowTheLists: a list's rows are held once; a sort or a
+// filter adds an order of them; a list explore leaves drops its rows, and
+// so does closing explore (amendment A4 §2.2, as revised).
+func TestHeldRowsFollowTheLists(t *testing.T) {
+	v := testVault(t)
+	h := start(t, v, setup{bar: "example.test"})
+	h.loaded()
+	h.held(1, "a query")
+	h.key("s")
+	h.loaded()
+	h.held(2, "a sort: the rows and their new order")
+	h.key("s")
+	h.loaded()
+	h.held(2, "another sort replaces the first")
+	h.key("enter")
+	h.loaded()
+	h.held(3, "a name's certificates")
+	h.key("esc")
+	h.settled()
+	h.held(2, "back from them")
+	h.key("tab")
+	h.loaded()
+	h.held(1, "another group")
+	h.toBar()
+	h.key("ctrl+u")
+	h.typ("exact:host1.example.test")
+	h.key("enter")
+	h.loaded()
+	h.held(1, "a new query")
+	h.key("R")
+	h.loaded()
+	h.held(1, "re-pinned")
+	h.tm.Quit()
+	h.tm.WaitFinished(t, teatest.WithFinalTimeout(20*time.Second))
+	h.m.Close()
+	h.held(0, "explore closed")
 }
 
 // TestOpenAndBack: Enter on a name lists its certificates, Enter on a
@@ -351,8 +405,8 @@ func TestEscCancels(t *testing.T) {
 	cancelled := make(chan error, 1)
 	release, answered := make(chan struct{}), make(chan struct{})
 	h := start(t, v, setup{tweak: func(m *Model) {
-		real := m.search
-		m.search = func(c context.Context, s *query.Snapshot, sess *query.Session, dirs []string, q query.Query, after *query.Cursor, n int) (*query.Page, error) {
+		real := m.hold
+		m.hold = func(c context.Context, s *query.Snapshot, sess *query.Session, dirs []string, q query.Query) (*query.Results, error) {
 			started <- q.Text
 			switch q.Text {
 			case "example.test": // slow until cancelled
@@ -362,9 +416,9 @@ func TestEscCancels(t *testing.T) {
 			case "host1.example.test": // ignores its context and answers late, with rows
 				<-release
 				defer close(answered)
-				return real(context.Background(), s, sess, dirs, q, after, n)
+				return real(context.Background(), s, sess, dirs, q)
 			}
-			return real(c, s, sess, dirs, q, after, n)
+			return real(c, s, sess, dirs, q)
 		}
 	}})
 	h.typ("example.test")
@@ -398,6 +452,24 @@ func TestEscCancels(t *testing.T) {
 	if rows := h.rows(); len(rows) != 1 || rows[0][0] != "host2.example.test" {
 		t.Fatalf("a late answer replaced the current one: %v", rows)
 	}
+	h.held(1, "the late answer's rows are dropped")
+
+	// An answer that completed, but arrives after its operation was
+	// replaced, gives back the rows no list took.
+	s, err := query.Open(v.Root, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := query.Hold(ctx, s, h.sess, v.Dirs, query.Query{Mode: query.ModeExact, Text: "host3.example.test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.held(2, "rows held for a stale answer")
+	h.tm.Send(pageMsg{seq: -1, l: &list{}, res: res, fresh: true, p: &query.Page{}})
+	h.held(1, "a stale answer's rows are dropped")
+	if rows := h.rows(); len(rows) != 1 || rows[0][0] != "host2.example.test" {
+		t.Fatalf("a stale answer changed the list: %v", rows)
+	}
 }
 
 // TestRepin: --as-of pins an earlier commit; R re-pins the latest
@@ -421,10 +493,10 @@ func TestBarErrors(t *testing.T) {
 	v := testVault(t)
 	var runs atomic.Int32
 	h := start(t, v, setup{tweak: func(m *Model) {
-		real := m.search
-		m.search = func(c context.Context, s *query.Snapshot, sess *query.Session, dirs []string, q query.Query, after *query.Cursor, n int) (*query.Page, error) {
+		real := m.hold
+		m.hold = func(c context.Context, s *query.Snapshot, sess *query.Session, dirs []string, q query.Query) (*query.Results, error) {
 			runs.Add(1)
-			return real(c, s, sess, dirs, q, after, n)
+			return real(c, s, sess, dirs, q)
 		}
 	}})
 	for bar, want := range map[string]string{
@@ -529,4 +601,27 @@ func diffTrees(a, b map[string]string) string {
 	}
 	slices.Sort(d)
 	return strings.Join(d, "\n")
+}
+
+// TestReloadBanner: explore checks ACTIVE.json's seq; when a switch
+// changes it, the status line asks for a reload, and R clears it
+// (amendment A5 §9).
+func TestReloadBanner(t *testing.T) {
+	v := testVault(t)
+	h := start(t, v, setup{bar: "example.test", tweak: func(m *Model) { m.pollEvery = 20 * time.Millisecond }})
+	h.loaded()
+	a, _, err := derive.ReadActive(v.Root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Seq++
+	if err := derive.WriteActive(v.Root, a); err != nil {
+		t.Fatal(err)
+	}
+	h.wait("the reload banner", func(st state) bool {
+		return strings.Contains(st.screen, "the dataset changed") && strings.Contains(st.screen, "press R to reload")
+	})
+	h.key("R")
+	h.loaded()
+	h.wait("the banner gone", func(st state) bool { return !strings.Contains(st.screen, "the dataset changed") })
 }

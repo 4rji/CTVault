@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 
 	"github.com/4rji/ctvault/internal/dataset"
 	"github.com/4rji/ctvault/internal/fsutil"
@@ -39,12 +41,15 @@ type DerivedTable struct {
 // keys sorted, no timestamps. Checksum is the SHA-256 of the file's JSON
 // written with Checksum empty.
 type Derived struct {
-	Format         int                     `json:"format"`
-	BatchID        string                  `json:"batch_id"`
-	Tables         map[string]DerivedTable `json:"tables"`
-	ParseStatus    map[string]int          `json:"parse_status"`
-	CTVaultVersion string                  `json:"ctvault_version"`
-	Checksum       string                  `json:"checksum"`
+	Format      int                     `json:"format"`
+	BatchID     string                  `json:"batch_id"`
+	Tables      map[string]DerivedTable `json:"tables"`
+	ParseStatus map[string]int          `json:"parse_status"`
+	// Retired names derived files that are no longer part of the batch,
+	// sorted, whichever manifest listed them (amendment A5 §9).
+	Retired        []string `json:"retired,omitempty"`
+	CTVaultVersion string   `json:"ctvault_version"`
+	Checksum       string   `json:"checksum"`
 }
 
 func (d Derived) encode() ([]byte, error) {
@@ -92,10 +97,18 @@ func ReadDerived(dir string, id BatchID) (d Derived, ok bool, err error) {
 	return d, true, nil
 }
 
+// Retired reports whether _DERIVED.json retired a file (amendment A5 §9).
+func (m Manifest) Retired(name string) bool {
+	return m.Derived != nil && slices.Contains(m.Derived.Retired, name)
+}
+
 // Listed returns the batch's entry for a file that _COMMIT.json or
 // _DERIVED.json lists: a file is part of a batch only then (amendment A2
 // §5.3).
 func (m Manifest) Listed(name string) (dataset.FileInfo, bool) {
+	if m.Retired(name) {
+		return dataset.FileInfo{}, false
+	}
 	if fi, ok := m.Files[name]; ok {
 		return fi, true
 	}
@@ -107,4 +120,46 @@ func (m Manifest) Listed(name string) (dataset.FileInfo, bool) {
 		}
 	}
 	return dataset.FileInfo{}, false
+}
+
+// HookRetireRecorded is the crash point between a retirement's record and
+// its delete (amendment A5 §11).
+const HookRetireRecorded = "retire_recorded"
+
+// Retire removes derived files from a committed batch (amendment A5 §9):
+// _DERIVED.json is rewritten with the files in its retired list, which is
+// the retirement's commit point, then the files are deleted and the folder
+// synced. A retired file is no longer part of the batch; if a crash leaves
+// it on disk, recovery deletes it as an unlisted file. _COMMIT.json is never
+// rewritten. It returns the manifest as it now stands.
+func Retire(p Paths, m Manifest, names []string, version string, hook func(string)) (Manifest, error) {
+	dir := p.BatchDir(m.ID())
+	d := Derived{Format: DerivedFormat, BatchID: m.BatchID, Tables: map[string]DerivedTable{}, CTVaultVersion: version}
+	if m.Derived != nil {
+		d = *m.Derived
+		d.Tables = maps.Clone(d.Tables)
+		d.Retired = slices.Clone(d.Retired)
+	}
+	for _, name := range names {
+		for t, dt := range d.Tables {
+			if dt.File == name {
+				delete(d.Tables, t)
+			}
+		}
+		if !slices.Contains(d.Retired, name) {
+			d.Retired = append(d.Retired, name)
+		}
+	}
+	slices.Sort(d.Retired)
+	if err := WriteDerived(dir, d); err != nil {
+		return m, err
+	}
+	m.Derived = &d
+	call(hook, HookRetireRecorded)
+	for _, name := range names {
+		if err := os.Remove(filepath.Join(dir, name)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return m, err
+		}
+	}
+	return m, fsutil.SyncDir(dir)
 }

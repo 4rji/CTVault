@@ -84,5 +84,6 @@ type Builder interface {
 	Build(c *extract.Cert, ctx Context) []Row
 }
 
-// Builders are this binary's builders, in a fixed order.
-var Builders = []Builder{Certs{}, Names{}}
+// Builders are the current version of each table this binary carries, in
+// the registry's order.
+var Builders = current(Registry)

@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"maps"
 	"os"
 	"path/filepath"
 
@@ -18,6 +17,7 @@ import (
 // repair --reindex crash points (amendment A2 §5.7).
 const (
 	HookReindexBuilding  = "reindex_building"  // the first batch is in the new index
+	HookReindexBuilt     = "reindex_built"     // every batch is in the new index; not yet checked
 	HookReindexSynced    = "reindex_synced"    // the new index is verified, closed and synced; not yet exchanged
 	HookReindexExchanged = "reindex_exchanged" // state/pebble is the new index; the old one is not yet deleted
 )
@@ -32,6 +32,10 @@ const (
 	probeB = ".exchange-probe-b"
 )
 
+// ReindexLeftovers are what an interrupted repair --reindex can leave in
+// state/: recovery deletes them, verify reports them as pending.
+var ReindexLeftovers = []string{ReindexDir, probeA, probeB}
+
 // renameExchange atomically swaps two paths (tests replace it).
 var renameExchange = func(a, b string) error {
 	return unix.Renameat2(unix.AT_FDCWD, a, unix.AT_FDCWD, b, unix.RENAME_EXCHANGE)
@@ -45,6 +49,7 @@ type ReindexOptions struct {
 	Codec     *vault.Codec // with every dictionary loaded
 	ChainIDs  func(path string) ([][32]byte, error)
 	Hook      func(string)
+	Progress  func(done, total int) // while the new index is checked; may be nil
 }
 
 // ReindexReport is what the new index holds.
@@ -98,30 +103,20 @@ func Reindex(o ReindexOptions) (ReindexReport, error) {
 	}
 	defer reader.Close()
 	ro := RecoverOptions{Paths: o.Paths, VaultDirs: o.VaultDirs, ChainIDs: o.ChainIDs}
-	certs := map[[32]byte]index.Ref{}
-	var chains [][32]byte
-	last := map[string]uint64{}
 	for i, m := range committed {
-		as, cs, err := applyBatch(x, reader, ro, m)
-		if err != nil {
+		if err := applyBatch(x, reader, ro, m); err != nil {
 			return rep, err
 		}
-		for _, a := range as {
-			if _, dup := certs[a.sha]; dup {
-				return rep, corrupt("certificate %x is vaulted twice (batch %s)", a.sha[:8], m.BatchID)
-			}
-			certs[a.sha] = a.ref
-		}
-		chains = append(chains, cs...)
-		last[m.Log] = m.CommitSeq
 		if i == 0 {
 			call(o.Hook, HookReindexBuilding)
 		}
 	}
-	if err := verifyIndex(x, certs, chains, last); err != nil {
-		return rep, err
+	call(o.Hook, HookReindexBuilt)
+	ir, err := CheckIndex(x, IndexCheck{Paths: o.Paths, VaultDirs: o.VaultDirs, Codec: o.Codec, ChainIDs: o.ChainIDs, Committed: committed, Progress: o.Progress})
+	if err != nil {
+		return rep, fmt.Errorf("checking the new index: %w", err)
 	}
-	rep = ReindexReport{Batches: len(committed), Certs: len(certs), Chains: len(uniq(chains))}
+	rep = ReindexReport{Batches: ir.Batches, Certs: ir.Certs, Chains: ir.Chains}
 
 	open = false
 	if err := x.Close(); err != nil {
@@ -150,54 +145,6 @@ func Reindex(o ReindexOptions) (ReindexReport, error) {
 		return rep, err
 	}
 	return rep, fsutil.SyncDir(state)
-}
-
-func uniq(ids [][32]byte) map[[32]byte]bool {
-	out := map[[32]byte]bool{}
-	for _, id := range ids {
-		out[id] = true
-	}
-	return out
-}
-
-// verifyIndex checks a rebuilt index against what was applied to it.
-func verifyIndex(x *index.Index, certs map[[32]byte]index.Ref, chains [][32]byte, last map[string]uint64) error {
-	for sha, want := range certs {
-		got, ok, err := x.Lookup(sha)
-		if err != nil {
-			return err
-		}
-		if !ok || got != want {
-			return fmt.Errorf("the new index maps %x to %+v (present: %v), the vault to %+v", sha[:8], got, ok, want)
-		}
-	}
-	n := 0
-	err := x.EachCert(func(sha [32]byte, _ index.Ref) error {
-		n++
-		if _, ok := certs[sha]; !ok {
-			return fmt.Errorf("the new index holds %x, which no committed vault record has", sha[:8])
-		}
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	if n != len(certs) {
-		return fmt.Errorf("the new index holds %d certificates, the vault %d", n, len(certs))
-	}
-	for _, id := range chains {
-		if ok, err := x.HasChain(id); err != nil || !ok {
-			return fmt.Errorf("the new index lacks chain %x (%v)", id[:8], err)
-		}
-	}
-	applied, err := x.AppliedLogs()
-	if err != nil {
-		return err
-	}
-	if !maps.Equal(applied, last) {
-		return fmt.Errorf("the new index has applied %v, the committed batches end at %v", applied, last)
-	}
-	return nil
 }
 
 // syncTree fsyncs every file and directory under dir.

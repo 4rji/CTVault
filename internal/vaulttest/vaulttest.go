@@ -169,8 +169,18 @@ func (v Vault) Committed(t testing.TB) map[string][]byte {
 	for _, m := range ms {
 		dir := paths.BatchDir(m.ID())
 		for name, fi := range m.Files {
+			if m.Retired(name) {
+				continue // no longer part of the batch (amendment A5 §9)
+			}
 			if got := fileSHA256(t, filepath.Join(dir, name)); got != fi.SHA256 {
 				t.Fatalf("%s/%s does not match its checksum", dir, name)
+			}
+		}
+		if m.Derived != nil {
+			for _, d := range m.Derived.Tables {
+				if got := fileSHA256(t, filepath.Join(dir, d.File)); got != d.SHA256 {
+					t.Fatalf("%s/%s does not match the checksum _DERIVED.json records", dir, d.File)
+				}
 			}
 		}
 		b, err := os.ReadFile(filepath.Join(dir, commit.ManifestFile))
@@ -461,6 +471,19 @@ func (v Vault) Dump(t testing.TB) Content {
 	return Content{Entries: out, Certs: v.derived(t, db, ms)}
 }
 
+// readable is the version of a derived table readers use, from
+// ACTIVE.json; def when the vault has none (a Plan 2 vault).
+func (v Vault) readable(name string, def derive.Table) derive.Table {
+	a, ok, err := derive.ReadActive(v.Root)
+	if err != nil || !ok {
+		return def
+	}
+	if t, ok := a.Readable(name); ok && len(t.Columns) > 0 {
+		return t
+	}
+	return def
+}
+
 // derived renders each certificate's derived rows without internal IDs: the
 // batch that built them, its certs row without cert_id, vault location and
 // delta base (whether a final is a leaf-delta depends on the delta cache;
@@ -468,13 +491,14 @@ func (v Vault) Dump(t testing.TB) Content {
 func (v Vault) derived(t testing.TB, db *sql.DB, ms []commit.Manifest) map[string]string {
 	t.Helper()
 	internal := map[string]bool{"cert_id": true, "vault_seg": true, "vault_off": true, "vault_len": true, "delta_base_cert_id": true}
+	certsT, namesT := v.readable("certs", derive.CertsV1), v.readable("names", derive.NamesV1)
 	var cols, ncols []string
-	for _, c := range derive.CertsV1.Columns {
+	for _, c := range certsT.Columns {
 		if !internal[c.Name] {
 			cols = append(cols, c.Name)
 		}
 	}
-	for _, c := range derive.NamesV1.Columns {
+	for _, c := range namesT.Columns {
 		if !internal[c.Name] {
 			ncols = append(ncols, c.Name)
 		}
@@ -482,17 +506,17 @@ func (v Vault) derived(t testing.TB, db *sql.DB, ms []commit.Manifest) map[strin
 	out := map[string]string{}
 	paths := commit.Paths{Root: v.Root}
 	for _, m := range ms {
-		if _, ok := m.Listed(derive.CertsV1.File()); !ok {
+		if _, ok := m.Listed(certsT.File()); !ok {
 			continue
 		}
 		dir := paths.BatchDir(m.ID())
 		names := map[uint64][]string{}
 		for _, r := range rendered(t, db, `SELECT cert_id, '', CAST(struct_pack(`+strings.Join(ncols, ", ")+`) AS VARCHAR) FROM read_parquet(`+
-			quote(filepath.Join(dir, derive.NamesV1.File()))+`, file_row_number = true) ORDER BY file_row_number`) {
+			quote(filepath.Join(dir, namesT.File()))+`, file_row_number = true) ORDER BY file_row_number`) {
 			names[r.id] = append(names[r.id], r.text)
 		}
 		for _, r := range rendered(t, db, `SELECT cert_id, sha256, CAST(struct_pack(`+strings.Join(cols, ", ")+`) AS VARCHAR) FROM read_parquet(`+
-			quote(filepath.Join(dir, derive.CertsV1.File()))+`) ORDER BY cert_id`) {
+			quote(filepath.Join(dir, certsT.File()))+`) ORDER BY cert_id`) {
 			if _, dup := out[r.sha]; dup {
 				t.Fatalf("certificate %s has certs rows in two batches", r.sha)
 			}
@@ -576,6 +600,7 @@ func (v Vault) CheckDerived(t testing.TB) {
 	}
 	db := duck(t)
 	paths := commit.Paths{Root: v.Root}
+	certsT, namesT := v.readable("certs", derive.CertsV1), v.readable("names", derive.NamesV1)
 	for _, m := range ms {
 		dir := paths.BatchDir(m.ID())
 		es, err := os.ReadDir(dir)
@@ -587,10 +612,10 @@ func (v Vault) CheckDerived(t testing.TB) {
 				t.Fatalf("batch %s holds %s, which neither _COMMIT.json nor _DERIVED.json lists", m.BatchID, e.Name())
 			}
 		}
-		if _, ok := m.Listed(derive.CertsV1.File()); !ok {
+		if _, ok := m.Listed(certsT.File()); !ok {
 			continue
 		}
-		certs := quote(filepath.Join(dir, derive.CertsV1.File()))
+		certs := quote(filepath.Join(dir, certsT.File()))
 		rows, err := db.Query(`SELECT cert_id, sha256, kind, vault_seg, vault_off, vault_len, coalesce(delta_base_cert_id, 0) FROM read_parquet(` + certs + `) ORDER BY cert_id`)
 		if err != nil {
 			t.Fatal(err)
@@ -624,7 +649,7 @@ func (v Vault) CheckDerived(t testing.TB) {
 			t.Fatalf("batch %s: %d certs rows for %d vault records", m.BatchID, i, len(recs))
 		}
 		var orphans int
-		names := quote(filepath.Join(dir, derive.NamesV1.File()))
+		names := quote(filepath.Join(dir, namesT.File()))
 		if err := db.QueryRow(`SELECT count(*) FROM read_parquet(` + names + `) WHERE cert_id NOT IN (SELECT cert_id FROM read_parquet(` + certs + `))`).Scan(&orphans); err != nil || orphans > 0 {
 			t.Fatalf("batch %s: %d names rows of no certificate in the batch (%v)", m.BatchID, orphans, err)
 		}

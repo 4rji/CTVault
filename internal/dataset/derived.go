@@ -68,7 +68,7 @@ func (s *Stager) BeginDerived(ctx context.Context, tables []derive.Table, keep i
 	}
 	d := &DerivedStage{s: s, conn: conn, rnd: rnd, keep: keep}
 	for _, t := range tables {
-		st := &stagedTable{table: t, stage: t.Name + "_stage"}
+		st := &stagedTable{table: t, stage: fmt.Sprintf("%s_p%d_stage", t.Name, t.Version)} // two versions of a table may stage together
 		d.tables = append(d.tables, st)
 		var cols []string
 		for _, c := range t.Columns {

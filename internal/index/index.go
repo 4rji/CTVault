@@ -80,6 +80,18 @@ func Open(dir string) (*Index, error) {
 	return &Index{db: db}, nil
 }
 
+// OpenReadOnly opens an existing index without writing to it: no new
+// options file, no flushed write-ahead log (verify's index check, amendment
+// A5 §2.2). Pebble still takes its directory lock, so the writer must not
+// hold the index open.
+func OpenReadOnly(dir string) (*Index, error) {
+	db, err := pebble.Open(dir, &pebble.Options{Logger: quiet{}, ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("opening index %s read-only: %w", dir, err)
+	}
+	return &Index{db: db}, nil
+}
+
 // Close closes the database.
 func (x *Index) Close() error { return x.db.Close() }
 
@@ -177,6 +189,27 @@ func (x *Index) EachCert(fn func(sha [32]byte, r Ref) error) error {
 	return it.Error()
 }
 
+// EachChain calls fn for every chain key, in ID order.
+func (x *Index) EachChain(fn func(id [32]byte) error) error {
+	upper := []byte(prefixChain)
+	upper[len(upper)-1]++ // "ch0": just past every "ch/" key
+	it, err := x.db.NewIter(&pebble.IterOptions{LowerBound: []byte(prefixChain), UpperBound: upper})
+	if err != nil {
+		return err
+	}
+	defer it.Close()
+	for it.First(); it.Valid(); it.Next() {
+		k := it.Key()
+		if len(k) != len(prefixChain)+32 {
+			return errors.New("index: malformed chain key")
+		}
+		if err := fn([32]byte(k[len(prefixChain):])); err != nil {
+			return err
+		}
+	}
+	return it.Error()
+}
+
 // Batch holds one batch's index writes in memory until the commit point
 // (spec §6.3: "an in-memory indexed batch until commit, which also catches
 // duplicates within a batch").
@@ -207,6 +240,13 @@ func (b *Batch) HasChain(id [32]byte) (bool, error) {
 	cl.Close()
 	return true, nil
 }
+
+// DeleteCert removes a certificate key. Only tests damage an index this
+// way; the writer never deletes keys.
+func (b *Batch) DeleteCert(sha [32]byte) error { return b.b.Delete(certKey(sha), nil) }
+
+// DeleteChain removes a chain key, for tests like DeleteCert.
+func (b *Batch) DeleteChain(id [32]byte) error { return b.b.Delete(chainKey(id), nil) }
 
 // AddChain records a chain written to this batch's chains.parquet.
 func (b *Batch) AddChain(id [32]byte) error { return b.b.Set(chainKey(id), nil, nil) }

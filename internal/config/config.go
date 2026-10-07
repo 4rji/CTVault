@@ -66,6 +66,9 @@ type Disk struct {
 
 type Rebuild struct {
 	Workers int `toml:"workers"`
+	// BatchesPerTurn is how many old batches update rebuilds after each
+	// batch it commits during a transition (amendment A5 §8).
+	BatchesPerTurn int `toml:"batches_per_turn"`
 }
 
 // Duration is a time.Duration written as a Go duration string ("10m").
@@ -120,7 +123,7 @@ func Default() Config {
 		Delta:   Delta{WarmBatches: 4},
 		Vault:   Vault{SegmentSize: 1 << 30},
 		Disk:    Disk{MaxUsedFraction: 0.85, SafetyFactor: 1.5},
-		Rebuild: Rebuild{Workers: 2},
+		Rebuild: Rebuild{Workers: 2, BatchesPerTurn: 1},
 	}
 }
 
@@ -153,6 +156,7 @@ safety_factor = 1.5
 
 [rebuild]
 workers = 2
+batches_per_turn = 1
 `
 
 // Load reads <root>/ctvault.toml over the defaults and validates the result.
@@ -204,6 +208,7 @@ func (c Config) Validate() error {
 	check(finite(c.Disk.MaxUsedFraction) && c.Disk.MaxUsedFraction > 0 && c.Disk.MaxUsedFraction <= 0.95, "disk.max_used_fraction must be in (0, 0.95]")
 	check(finite(c.Disk.SafetyFactor) && c.Disk.SafetyFactor >= 1 && c.Disk.SafetyFactor <= 10, "disk.safety_factor must be 1-10")
 	check(c.Rebuild.Workers >= 1 && c.Rebuild.Workers <= 64, "rebuild.workers must be 1-64")
+	check(c.Rebuild.BatchesPerTurn >= 1 && c.Rebuild.BatchesPerTurn <= 1000, "rebuild.batches_per_turn must be 1-1000")
 	if len(errs) > 0 {
 		return fmt.Errorf("%s: %w", FileName, errors.Join(errs...))
 	}

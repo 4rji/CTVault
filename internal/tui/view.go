@@ -181,6 +181,8 @@ func (m *Model) status() string {
 		left = m.msg
 	case m.busy != "":
 		left = m.busy + "… (Esc cancels)"
+	case m.changed != "":
+		left = m.changed
 	default:
 		left = m.counts()
 	}
@@ -196,10 +198,8 @@ func (m *Model) status() string {
 func (m *Model) counts() string {
 	var parts []string
 	if l := m.top(); l != nil && l.cols != nil {
-		n, unit := strconv.Itoa(len(l.rows)), l.q.Group
-		if l.next != nil {
-			n += "+"
-		} else if len(l.rows) == 1 {
+		n, unit := strconv.Itoa(l.total), l.q.Group
+		if l.total == 1 {
 			unit = strings.TrimSuffix(unit, "s")
 		}
 		parts = append(parts, n+" "+unit, fmt.Sprintf("%d ms", l.took.Milliseconds()))
@@ -207,12 +207,15 @@ func (m *Model) counts() string {
 			parts = append(parts, fmt.Sprintf("%d marked", len(l.marks)))
 		}
 	}
-	for _, t := range []derive.Table{derive.CertsV1, derive.NamesV1} {
-		st := m.snap.Active.Tables[t.Name]
-		if st.Status == derive.StatusComplete && st.Active != nil {
-			parts = append(parts, fmt.Sprintf("%s v%d ✓", t.Name, *st.Active))
-		} else {
-			parts = append(parts, t.Name+" "+st.Status)
+	for _, name := range []string{derive.CertsV1.Name, derive.NamesV1.Name} {
+		st := m.snap.Active.Tables[name]
+		switch t, ok := m.snap.Active.Readable(name); {
+		case ok && st.Building != nil:
+			parts = append(parts, fmt.Sprintf("%s v%d ✓ (v%d building)", name, t.Version, *st.Building))
+		case ok:
+			parts = append(parts, fmt.Sprintf("%s v%d ✓", name, t.Version))
+		default:
+			parts = append(parts, name+" "+st.Status)
 		}
 	}
 	parts = append(parts, fmt.Sprintf("as-of commit %d", m.snap.AsOf))
@@ -302,16 +305,35 @@ func (m *Model) refreshTable() {
 		return
 	}
 	rows := make([]table.Row, len(l.rows))
-	for i, r := range l.rows {
-		row := make(table.Row, 0, len(r)+1)
-		row = append(row, l.marker(i))
-		for _, v := range r {
-			row = append(row, cell(v))
-		}
-		rows[i] = row
+	for i := range l.rows {
+		rows[i] = l.tableRow(i)
 	}
 	m.table.SetRows(rows)
 	m.table.SetCursor(l.cursor)
+}
+
+// appendRows adds l's rows from i on to a table that shows the ones
+// before: a page costs its own rows, not every row loaded so far.
+func (m *Model) appendRows(l *list, i int) {
+	rows := m.table.Rows()
+	if len(rows) != i {
+		m.refreshTable()
+		return
+	}
+	for ; i < len(l.rows); i++ {
+		rows = append(rows, l.tableRow(i))
+	}
+	m.table.SetRows(rows)
+}
+
+// tableRow is row i in the table: its marker, then its cells.
+func (l *list) tableRow(i int) table.Row {
+	row := make(table.Row, 0, len(l.rows[i])+1)
+	row = append(row, l.marker(i))
+	for _, v := range l.rows[i] {
+		row = append(row, cell(v))
+	}
+	return row
 }
 
 // markRow redraws row i's marker.

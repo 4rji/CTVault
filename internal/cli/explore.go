@@ -14,6 +14,7 @@ import (
 // read-only terminal UI. It takes no lock.
 func newExploreCmd(a *app) *cobra.Command {
 	var asOf uint64
+	var mixed query.MixedRead
 	cmd := &cobra.Command{
 		Use:   "explore [query]",
 		Short: "Browse the committed snapshot in a terminal UI (read-only)",
@@ -26,7 +27,7 @@ The session stays on its commit until R re-pins the latest.`,
 			if !isTerminal(in) || !isTerminal(out) {
 				return usagef("explore needs a terminal; use `ctvault search` in scripts and pipes")
 			}
-			r, err := a.openReader(c, asOf)
+			r, err := a.openReader(c, asOf, mixed)
 			if err != nil {
 				return err
 			}
@@ -38,6 +39,7 @@ The session stays on its commit until R re-pins the latest.`,
 		},
 	}
 	cmd.Flags().Uint64Var(&asOf, "as-of", 0, "browse as of an earlier commit_seq (default: the latest)")
+	mixedFlags(cmd, &mixed)
 	return cmd
 }
 

@@ -30,6 +30,7 @@ func newFetchCmd(a *app) *cobra.Command {
 	var format string
 	var withChain, withEntries, force bool
 	var asOf uint64
+	var mixed query.MixedRead
 	var output string
 	cmd := &cobra.Command{
 		Use:   "fetch <sha256 | cert_id> [--format pem|der|text|json] [--with-chain] [--with-entries]",
@@ -64,7 +65,7 @@ func newFetchCmd(a *app) *cobra.Command {
 				}
 				id = n
 			}
-			r, err := a.openReader(c, asOf)
+			r, err := a.openReader(c, asOf, mixed)
 			if err != nil {
 				return err
 			}
@@ -116,6 +117,7 @@ func newFetchCmd(a *app) *cobra.Command {
 	fl.Uint64Var(&asOf, "as-of", 0, "read the committed snapshot as of this commit_seq")
 	fl.StringVar(&output, "output", "", "write to this file instead of stdout (atomically)")
 	fl.BoolVar(&force, "force", false, "replace an existing --output file")
+	mixedFlags(cmd, &mixed)
 	return cmd
 }
 

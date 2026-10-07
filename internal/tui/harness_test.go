@@ -248,6 +248,23 @@ func (h *harness) all() state {
 	}
 }
 
+// held waits until the session holds want tables of rows: a dropped
+// answer's rows are closed when it arrives.
+func (h *harness) held(want int, what string) {
+	h.t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		n, err := h.sess.Held(ctx)
+		if err == nil && n == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			h.t.Fatalf("%s: %d held tables, want %d (%v)", what, n, want, err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // rows is the shown list's rows once idle.
 func (h *harness) rows() [][]any {
 	h.t.Helper()

@@ -60,12 +60,53 @@ func TestExploreOnRealData(t *testing.T) {
 	h.toBar()
 	h.group("names")
 	h.query(common)
+	began := time.Now()
 	h.key("s")
+	h.loaded()
+	sorted := time.Since(began)
 	h.key("/")
 	h.typ("api")
+	began = time.Now()
 	h.key("enter")
+	h.loaded()
+	filtered := time.Since(began)
 	h.all()
 	sameRows(t, "filtered and sorted", h.rows(), h.search(query.Query{Mode: query.ModeDomain, Text: common, Sort: "name desc", Filter: "api"}))
+	t.Logf("%s names: a sort %v, the filter %v (both from the held rows)", common, sorted.Round(time.Millisecond), filtered.Round(time.Millisecond))
+
+	// The query package alone, without the UI: the held rows' pages, and
+	// keyset pages that re-run the query.
+	snap, err := query.Open(v.Root, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := query.Query{Mode: query.ModeDomain, Text: common}
+	began = time.Now()
+	res, err := query.Hold(ctx, snap, h.sess, v.Dirs, q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Close()
+	held := time.Since(began)
+	began, pages := time.Now(), 0
+	for from := 0; from < res.Len(); from += pageSize {
+		if _, err := res.Page(ctx, from, pageSize); err != nil {
+			t.Fatal(err)
+		}
+		pages++
+	}
+	heldPages := time.Since(began)
+	began = time.Now()
+	var after *query.Cursor
+	for i := 0; i < 5; i++ {
+		p, err := query.SearchPage(ctx, snap, h.sess, v.Dirs, q, after, pageSize)
+		if err != nil {
+			t.Fatal(err)
+		}
+		after = p.Next
+	}
+	t.Logf("query alone: hold %v; %d held pages %v (%v each); a keyset page %v", held.Round(time.Millisecond), pages, heldPages.Round(time.Millisecond),
+		(heldPages / time.Duration(pages)).Round(10*time.Microsecond), (time.Since(began) / 5).Round(time.Millisecond))
 }
 
 // domains picks the eTLD+1 with the most names and one with 5 to 20.

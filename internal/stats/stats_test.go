@@ -134,3 +134,35 @@ func TestVaultSummary(t *testing.T) {
 		}
 	}
 }
+
+// TestTransitionsInStats: stats shows each transition's progress and warns
+// prominently about a mixed table (amendment A5 §8, §10).
+func TestTransitionsInStats(t *testing.T) {
+	ms := batches(4, time.Hour)
+	ms[0].Files["certs.p2.parquet"] = dataset.FileInfo{Bytes: 50_000}
+	in := input(ms)
+	one, two := 1, 2
+	at := now.Add(-2 * time.Hour)
+	for _, c := range []struct {
+		state derive.TableState
+		want  []string
+	}{
+		{derive.TableState{Active: &one, Building: &two, Status: derive.StatusBuilding}, []string{"certs v1 complete, v2 building (1 of 4 batches)"}},
+		{derive.TableState{Active: &one, Building: &two, Status: derive.StatusMixed},
+			[]string{"certs mixed (v2 in 1 of 4 batches)", "WARNING: certs is mixed", "--parser-version or --allow-mixed", "rebuild --in-place"}},
+		{derive.TableState{Active: &two, Status: derive.StatusComplete, Retiring: &one, SwitchedAt: &at}, []string{"certs v2 complete, v1 retiring since"}},
+	} {
+		in.Active = derive.Complete()
+		in.Active.Tables["certs"] = c.state
+		r := Compute(in)
+		text := Text(r)
+		for _, w := range c.want {
+			if !strings.Contains(text, w) {
+				t.Errorf("%+v: no %q in\n%s", c.state, w, text)
+			}
+		}
+		if c.state.Building != nil && (len(r.Vault.Transitions) != 1 || r.Vault.Transitions[0].Done != 1 || r.Vault.Transitions[0].Total != 4) {
+			t.Errorf("transitions %+v", r.Vault.Transitions)
+		}
+	}
+}

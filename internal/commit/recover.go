@@ -164,7 +164,7 @@ func Recover(o RecoverOptions) (Recovered, error) {
 	if err := removeUnlistedDerived(o, committed, &r); err != nil {
 		return r, err
 	}
-	for _, name := range []string{ReindexDir, probeA, probeB} {
+	for _, name := range ReindexLeftovers {
 		p := filepath.Join(o.Paths.StateDir(), name)
 		if _, err := os.Stat(p); err == nil {
 			if err := os.RemoveAll(p); err != nil {
@@ -224,7 +224,7 @@ func catchUp(o RecoverOptions, committed []Manifest, r *Recovered) error {
 				return err
 			}
 		}
-		if _, _, err := applyBatch(o.Index, reader, o, m); err != nil {
+		if err := applyBatch(o.Index, reader, o, m); err != nil {
 			return err
 		}
 		applied[m.Log] = m.CommitSeq
@@ -233,17 +233,10 @@ func catchUp(o RecoverOptions, committed []Manifest, r *Recovered) error {
 	return nil
 }
 
-// applied is what applyBatch wrote for one certificate.
-type applied struct {
-	sha [32]byte
-	ref index.Ref
-}
-
 // applyBatch writes a committed batch to the index in one Pebble batch: its
 // vault records' certificates, the chains of its chains.parquet, and its
 // commit_seq as the log's applied position. It is idempotent.
-func applyBatch(x *index.Index, reader *vault.Reader, o RecoverOptions, m Manifest) ([]applied, [][32]byte, error) {
-	var certs []applied
+func applyBatch(x *index.Index, reader *vault.Reader, o RecoverOptions, m Manifest) error {
 	b := x.NewBatch()
 	defer b.Close()
 	err := vault.Scan(o.VaultDirs, m.Vault.Start, m.Vault.End, func(loc vault.Loc, rec vault.Record) error {
@@ -251,12 +244,10 @@ func applyBatch(x *index.Index, reader *vault.Reader, o RecoverOptions, m Manife
 		if err != nil {
 			return err
 		}
-		a := applied{sha: sha256.Sum256(der), ref: index.Ref{CertID: rec.CertID, Loc: loc}}
-		certs = append(certs, a)
-		return b.AddCert(a.sha, a.ref)
+		return b.AddCert(sha256.Sum256(der), index.Ref{CertID: rec.CertID, Loc: loc})
 	})
-	var chains [][32]byte
 	if err == nil {
+		var chains [][32]byte
 		chains, err = o.ChainIDs(filepath.Join(o.Paths.BatchDir(m.ID()), dataset.ChainsFile))
 		for _, id := range chains {
 			if err == nil {
@@ -271,9 +262,9 @@ func applyBatch(x *index.Index, reader *vault.Reader, o RecoverOptions, m Manife
 		err = b.Commit()
 	}
 	if err != nil {
-		return nil, nil, fmt.Errorf("applying batch %s to the index: %w", m.BatchID, err)
+		return fmt.Errorf("applying batch %s to the index: %w", m.BatchID, err)
 	}
-	return certs, chains, nil
+	return nil
 }
 
 // removeInterruptedWrites deletes what a writer killed inside
@@ -335,6 +326,10 @@ const ReindexDir = "pebble.reindex"
 // derivedName matches a derived table's file name, <table>.p<version>.parquet.
 var derivedName = regexp.MustCompile(`^[a-z][a-z0-9_]*\.p[0-9]+\.parquet$`)
 
+// IsDerivedFile reports whether name is a derived table's file name,
+// "<table>.p<N>.parquet".
+func IsDerivedFile(name string) bool { return derivedName.MatchString(name) }
+
 // removeUnlistedDerived deletes, in committed batch directories, the derived
 // files neither _COMMIT.json nor _DERIVED.json lists, and the temp files of
 // an interrupted _DERIVED.json write: a rebuild killed after placing its
@@ -343,30 +338,43 @@ var derivedName = regexp.MustCompile(`^[a-z][a-z0-9_]*\.p[0-9]+\.parquet$`)
 func removeUnlistedDerived(o RecoverOptions, committed []Manifest, r *Recovered) error {
 	for _, m := range committed {
 		dir := o.Paths.BatchDir(m.ID())
-		es, err := os.ReadDir(dir)
+		names, err := UnlistedDerived(dir, m)
 		if err != nil {
 			return err
 		}
-		removed := false
-		for _, e := range es {
-			name := e.Name()
-			if _, listed := m.Listed(name); listed || !e.Type().IsRegular() {
-				continue
-			}
-			if !derivedName.MatchString(name) && !(fsutil.IsAtomicTemp(name) && strings.HasPrefix(name, "."+DerivedFile+".")) {
-				continue
-			}
+		for _, name := range names {
 			if err := os.Remove(filepath.Join(dir, name)); err != nil {
 				return err
 			}
-			removed = true
 			r.Actions = append(r.Actions, "removed unlisted derived file "+m.BatchID+"/"+name)
 		}
-		if removed {
+		if len(names) > 0 {
 			if err := fsutil.SyncDir(dir); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+// UnlistedDerived names the files in a committed batch directory that a
+// rebuild placed but no manifest lists yet: derived files, and the temp
+// files of an interrupted _DERIVED.json write. Recovery deletes them;
+// verify reports them as recovery pending.
+func UnlistedDerived(dir string, m Manifest) ([]string, error) {
+	es, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, e := range es {
+		name := e.Name()
+		if _, listed := m.Listed(name); listed || !e.Type().IsRegular() {
+			continue
+		}
+		if derivedName.MatchString(name) || (fsutil.IsAtomicTemp(name) && strings.HasPrefix(name, "."+DerivedFile+".")) {
+			out = append(out, name)
+		}
+	}
+	return out, nil
 }

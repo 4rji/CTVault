@@ -6,6 +6,7 @@ package querytest
 import (
 	"context"
 	"crypto/x509"
+	"encoding/base64"
 	"io"
 	"os"
 	"path/filepath"
@@ -13,11 +14,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/4rji/ctvault/internal/commit"
 	"github.com/4rji/ctvault/internal/config"
 	"github.com/4rji/ctvault/internal/ctlogtest"
 	"github.com/4rji/ctvault/internal/diskguard"
 	"github.com/4rji/ctvault/internal/fetch"
 	"github.com/4rji/ctvault/internal/ingest"
+	"github.com/4rji/ctvault/internal/logreg"
 	"github.com/4rji/ctvault/internal/logsource"
 	"github.com/4rji/ctvault/internal/logsource/rfc6962"
 )
@@ -72,7 +75,15 @@ func Pairs(t testing.TB, n int) (*ctlogtest.Generator, []ctlogtest.Entry) {
 // of lru entries.
 func New(t testing.TB, g *ctlogtest.Generator, es []ctlogtest.Entry, size uint64, lru int) *Vault {
 	t.Helper()
-	ctx := context.Background()
+	v, _ := NewPublished(t, g, es, len(es), size, lru)
+	return v
+}
+
+// NewPublished is New with the fake log publishing only its first n
+// entries, which are ingested; the log is returned so that a test can
+// publish more and Ingest them.
+func NewPublished(t testing.TB, g *ctlogtest.Generator, es []ctlogtest.Entry, n int, size uint64, lru int) (*Vault, *ctlogtest.Log) {
+	t.Helper()
 	root := t.TempDir()
 	for _, d := range []string{"state/intent", "state/incidents", "state/logs", "vault/segments", "vault/dict", "dataset", "tmp/stage", "tmp/rebuild"} {
 		if err := os.MkdirAll(filepath.Join(root, d), 0o755); err != nil {
@@ -81,32 +92,64 @@ func New(t testing.TB, g *ctlogtest.Generator, es []ctlogtest.Entry, size uint64
 	}
 	v := &Vault{Root: root, Dirs: []string{filepath.Join(root, "vault")}, Gen: g, Entries: es}
 	l := ctlogtest.NewWithEntries(t, es, ctlogtest.Options{})
+	l.Publish(uint64(n))
+	// Pinned as `logs add` pins a log, so verify can check signed heads.
+	if err := logreg.Add(root, logreg.Record{Name: "fakelog", URL: l.URL, LogID: base64.StdEncoding.EncodeToString(l.LogID[:]),
+		Key: base64.StdEncoding.EncodeToString(l.PublicKeyDER), State: "usable"}); err != nil {
+		t.Fatal(err)
+	}
+	Ingest(t, v, l, size, lru, nil)
+	return v, l
+}
+
+// Ingest commits the log's published entries past the vault's end in
+// batches of size, as update does, calling each after every batch.
+func Ingest(t testing.TB, v *Vault, l *ctlogtest.Log, size uint64, lru int, each func(commit.Manifest)) {
+	t.Helper()
+	ctx := context.Background()
 	pub, err := x509.ParsePKIXPublicKey(l.PublicKeyDER)
 	if err != nil {
 		t.Fatal(err)
 	}
 	chains := logsource.NewChainCache(logsource.DefaultChainCacheBytes)
 	src := rfc6962.NewSource(logsource.LogInfo{Name: "fakelog", LogID: l.LogID, PublicKey: pub, URL: l.URL}, nil, chains, nil)
-	cfg := config.Default()
-	cfg.Ingest.DeltaLRUEntries = lru
-	cfg.Vault.SegmentSize = 64 << 10
-	w, err := ingest.Open(ingest.Options{Root: root, VaultDirs: v.Dirs, Config: cfg, Guard: Guard,
-		Version: "test", Out: io.Discard, DictSamples: 1 << 30, CanarySamples: 16,
-		Fetch: fetch.Options{MaxRPS: 1000, MinBackoff: time.Millisecond, MaxBackoff: 5 * time.Millisecond},
-		Now:   func() time.Time { return time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC) }})
-	if err != nil {
-		t.Fatal(err)
-	}
+	w := Open(t, v, lru)
 	defer w.Close()
 	sth, err := src.Head(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for first := uint64(0); first < uint64(len(es)); first += size {
-		if _, err := w.Batch(ctx, src, sth, first, min(first+size, uint64(len(es)))); err != nil {
+	for first := w.Next("fakelog"); first < sth.TreeSize; first += size {
+		m, err := w.Batch(ctx, src, sth, first, min(first+size, sth.TreeSize))
+		if err != nil {
 			t.Fatal(err)
 		}
 		chains.Reset()
+		if each != nil {
+			each(m)
+		}
 	}
-	return v
+}
+
+// Options are the writer options of every test vault, with a delta cache
+// of lru entries.
+func Options(v *Vault, lru int) ingest.Options {
+	cfg := config.Default()
+	cfg.Ingest.DeltaLRUEntries = lru
+	cfg.Vault.SegmentSize = 64 << 10
+	return ingest.Options{Root: v.Root, VaultDirs: v.Dirs, Config: cfg, Guard: Guard,
+		Version: "test", Out: io.Discard, DictSamples: 1 << 30, CanarySamples: 16,
+		Fetch: fetch.Options{MaxRPS: 1000, MinBackoff: time.Millisecond, MaxBackoff: 5 * time.Millisecond},
+		Now:   func() time.Time { return time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC) }}
+}
+
+// Open opens the vault's writer, as update and rebuild do: recovery runs.
+// The caller closes it.
+func Open(t testing.TB, v *Vault, lru int) *ingest.Writer {
+	t.Helper()
+	w, err := ingest.Open(Options(v, lru))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return w
 }

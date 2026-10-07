@@ -46,10 +46,10 @@ type Fetcher struct {
 	r     *vault.Reader
 }
 
-// NewFetcher needs the certs table complete; it loads the dictionaries
+// NewFetcher needs the certs table readable; it loads the dictionaries
 // read-only.
 func NewFetcher(s *Snapshot, sess *Session, vaultDirs []string) (*Fetcher, error) {
-	if err := s.Ready(derive.CertsV1); err != nil {
+	if _, err := s.Table("certs"); err != nil {
 		return nil, err
 	}
 	codec, err := vault.NewCodec()
@@ -84,8 +84,7 @@ func (f *Fetcher) Close() {
 // BySHA256 finds a certificate through the bloom filters on certs.sha256.
 // The hex literal is inlined so DuckDB can prune with it.
 func (f *Fetcher) BySHA256(ctx context.Context, sha [32]byte) (*Cert, error) {
-	files := f.s.Files(derive.CertsV1.File())
-	return f.lookup(ctx, files, "sha256 = "+quote(hex.EncodeToString(sha[:])))
+	return f.lookup(ctx, f.s.TableFiles("certs"), "sha256 = "+quote(hex.EncodeToString(sha[:])))
 }
 
 // Locate finds a certificate's certs row by SHA-256 without reading the
@@ -96,11 +95,11 @@ func (f *Fetcher) Locate(ctx context.Context, sha [32]byte) (map[string]any, err
 }
 
 func locate(ctx context.Context, s *Snapshot, sess *Session, sha [32]byte) (map[string]any, error) {
-	files := s.Files(derive.CertsV1.File())
+	files := s.TableFiles("certs")
 	if len(files) == 0 {
 		return nil, ErrNotFound
 	}
-	rows, err := scanMaps(ctx, sess.db, `SELECT * FROM read_parquet(`+fileList(files)+`, hive_partitioning = true) WHERE sha256 = `+
+	rows, err := scanMaps(ctx, sess.db, `SELECT * FROM read_parquet(`+fileList(files)+s.unionOpt("certs")+`, hive_partitioning = true) WHERE sha256 = `+
 		quote(hex.EncodeToString(sha[:])))
 	if err != nil {
 		return nil, err
@@ -124,10 +123,11 @@ func (f *Fetcher) ByCertID(ctx context.Context, id uint64) (*Cert, error) {
 		if m.CertIDRange == nil || id < m.CertIDRange[0] || id > m.CertIDRange[1] {
 			continue
 		}
-		if _, ok := m.Listed(derive.CertsV1.File()); !ok {
-			return nil, fmt.Errorf("certs %w", ErrBuilding)
+		file, ok := f.s.batchFile(m, "certs")
+		if !ok {
+			return nil, fmt.Errorf("certs of batch %s: %w", m.BatchID, ErrBuilding)
 		}
-		return f.lookup(ctx, []string{filepath.Join(p.BatchDir(m.ID()), derive.CertsV1.File())}, "cert_id = "+strconv.FormatUint(id, 10))
+		return f.lookup(ctx, []string{filepath.Join(p.BatchDir(m.ID()), file)}, "cert_id = "+strconv.FormatUint(id, 10))
 	}
 	return nil, fmt.Errorf("cert_id %d is %w", id, ErrNotFound)
 }
@@ -136,7 +136,7 @@ func (f *Fetcher) lookup(ctx context.Context, files []string, where string) (*Ce
 	if len(files) == 0 {
 		return nil, ErrNotFound
 	}
-	rows, err := scanMaps(ctx, f.sess.db, `SELECT * FROM read_parquet(`+fileList(files)+`, hive_partitioning = true) WHERE `+where)
+	rows, err := scanMaps(ctx, f.sess.db, `SELECT * FROM read_parquet(`+fileList(files)+f.s.unionOpt("certs")+`, hive_partitioning = true) WHERE `+where)
 	if err != nil {
 		return nil, err
 	}
@@ -165,11 +165,14 @@ func (f *Fetcher) lookup(ctx context.Context, files []string, where string) (*Ce
 // Names returns the certificate's names rows, in the order ingest wrote
 // them.
 func (f *Fetcher) Names(ctx context.Context, c *Cert) ([]map[string]any, error) {
-	files := f.s.Files(derive.NamesV1.File())
-	if err := f.s.Ready(derive.NamesV1); err != nil || len(files) == 0 {
+	if _, err := f.s.Table("names"); err != nil {
 		return nil, err
 	}
-	return scanMaps(ctx, f.sess.db, `SELECT source, name, dns_valid, is_wildcard, tld, etld1 FROM read_parquet(`+fileList(files)+
+	files := f.s.TableFiles("names")
+	if len(files) == 0 {
+		return nil, nil
+	}
+	return scanMaps(ctx, f.sess.db, `SELECT source, name, dns_valid, is_wildcard, tld, etld1 FROM read_parquet(`+fileList(files)+f.s.unionOpt("names")+
 		`, file_row_number = true) WHERE cert_id = `+strconv.FormatUint(c.CertID, 10)+` ORDER BY file_row_number`)
 }
 
@@ -286,12 +289,12 @@ func CountNames(ctx context.Context, s *Snapshot, sess *Session, column, value s
 	if column != "name" && column != "etld1" {
 		return 0, fmt.Errorf("query: CountNames on %q", column)
 	}
-	files := s.Files(derive.NamesV1.File())
+	files := s.TableFiles("names")
 	if len(files) == 0 {
 		return 0, nil
 	}
 	var n int64
-	err := sess.db.QueryRowContext(ctx, `SELECT count(*) FROM read_parquet(`+fileList(files)+`) WHERE `+column+` = `+quote(value)).Scan(&n)
+	err := sess.db.QueryRowContext(ctx, `SELECT count(*) FROM read_parquet(`+fileList(files)+s.unionOpt("names")+`) WHERE `+column+` = `+quote(value)).Scan(&n)
 	return n, err
 }
 
@@ -313,7 +316,7 @@ func (f *Fetcher) Linked(ctx context.Context, c *Cert) (*Cert, error) {
 		}
 	case derive.KindPrecert:
 		var final uint64
-		err := f.sess.db.QueryRowContext(ctx, `SELECT cert_id FROM read_parquet(`+fileList(f.s.Files(derive.CertsV1.File()))+
+		err := f.sess.db.QueryRowContext(ctx, `SELECT cert_id FROM read_parquet(`+fileList(f.s.TableFiles("certs"))+f.s.unionOpt("certs")+
 			`) WHERE delta_base_cert_id = `+id+` ORDER BY cert_id LIMIT 1`).Scan(&final)
 		if err == nil {
 			return f.ByCertID(ctx, final)

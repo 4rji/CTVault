@@ -25,14 +25,16 @@ func CheckSegments(dirs []string, uuid [16]byte, tail Tail) error {
 		if !ok {
 			return corrupt("segment %d is missing", id)
 		}
-		if err := checkHeader(p, id, uuid); err != nil {
+		if err := CheckHeader(p, id, uuid); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func checkHeader(p string, id uint64, uuid [16]byte) error {
+// CheckHeader checks one segment file's header: intact, naming segment id
+// and this vault's UUID.
+func CheckHeader(p string, id uint64, uuid [16]byte) error {
 	f, err := os.Open(p)
 	if err != nil {
 		return err

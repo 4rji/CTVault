@@ -21,6 +21,7 @@ import (
 	"github.com/4rji/ctvault/internal/index"
 	"github.com/4rji/ctvault/internal/logsource"
 	"github.com/4rji/ctvault/internal/logsource/rfc6962"
+	"github.com/4rji/ctvault/internal/merkle"
 	"github.com/4rji/ctvault/internal/vault"
 )
 
@@ -123,6 +124,41 @@ func TestIngestCommitsVerifiedBatches(t *testing.T) {
 	}
 	if root, _ := ms[3].MerkleAfter.Root(); root != sth.RootHash {
 		t.Fatal("the final compact range must reach the signed root")
+	}
+	// The proofs are recorded, so verify can re-check them offline
+	// (amendment A5 §2.3); the batch that ends at the STH needs none.
+	stored, err := commit.ListCommitted(h.opts.Root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, m := range stored {
+		proof, err := m.Verified.DecodeProof()
+		if err != nil {
+			t.Fatalf("batch %d: %v", i, err)
+		}
+		if i == 3 {
+			if len(proof) != 0 {
+				t.Fatalf("batch 3 ends at the STH, yet records %d proof nodes", len(proof))
+			}
+			continue
+		}
+		root, _ := m.MerkleAfter.Root()
+		if len(proof) == 0 || len(proof) != m.Verified.ProofNodes || merkle.VerifyConsistency(m.Last+1, sth.TreeSize, root, sth.RootHash, proof) != nil {
+			t.Fatalf("batch %d: %d recorded proof nodes (%d checked at ingest) do not prove its root", i, len(proof), m.Verified.ProofNodes)
+		}
+	}
+	// A field a later version adds is ignored, as verified.proof is by
+	// earlier binaries.
+	mp := filepath.Join(commit.Paths{Root: h.opts.Root}.BatchDir(stored[0].ID()), commit.ManifestFile)
+	b, err := os.ReadFile(mp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(mp, append([]byte(`{"a_later_field": [1, 2], `), b[1:]...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if again, err := commit.ListCommitted(h.opts.Root); err != nil || len(again) != 4 {
+		t.Fatalf("a manifest with an unknown field: %v", err)
 	}
 	total := 0
 	for i, m := range ms {
